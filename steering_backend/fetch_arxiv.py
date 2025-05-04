@@ -85,14 +85,6 @@ def create_search_query(category, subcategory=None):
     return query
 
 
-def create_output_dirs(base_dir):
-    """Create output directory for PDFs."""
-    pdf_dir = os.path.join(base_dir, "pdfs")
-    Path(pdf_dir).mkdir(parents=True, exist_ok=True)
-    
-    return pdf_dir
-
-
 def sanitize_filename(title, max_length=100):
     """Create a safe filename from the paper title."""
     # Replace invalid filename characters
@@ -134,8 +126,9 @@ def download_paper_task(result, pdf_dir):
     """Task function to download a single paper's PDF.
     Returns a tuple: (result, pdf_status, filename_base)
     """
-    safe_title = sanitize_filename(result.title)
-    filename_base = f"{result.get_short_id()}_{safe_title}"
+    # Extract only the numeric part of the ID (handles formats like '2310.12345' and 'math/0101001')
+    numeric_id = result.get_short_id().split('/')[-1]
+    filename_base = numeric_id
     pdf_filename = f"{filename_base}.pdf"
     pdf_status = "Not Downloaded"
     try:
@@ -152,7 +145,7 @@ def main():
     args = parser.parse_args()
     
     # Create output directories
-    pdf_dir = create_output_dirs(args.output_dir)
+    pdf_dir = args.output_dir
     
     # Create metadata log file
     log_file = os.path.join(args.output_dir, f"arxiv_download_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
