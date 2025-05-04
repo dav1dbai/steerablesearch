@@ -7,17 +7,21 @@ import glob
 import json
 import logging
 import os
+import random
 
 # Third-party Imports
 import faiss
 import numpy as np
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends
 from PyPDF2 import PdfReader
 from pydantic import BaseModel
 
 # Local Application Imports
-from embed import (_MLX_AVAILABLE, _TORCH_AVAILABLE, # Assuming these indicate availability
-                   load_embedding_model)
+from sae import SAEModel  # Import the new SAEModel class
+from embed import (load_embedding_model,
+                   embed_mlx, embed_torch, # Keep specific functions if needed for type check
+                   _MLX_AVAILABLE, _TORCH_AVAILABLE) # Import availability flags
+import torch # Need torch for tensor operations
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO)
@@ -30,16 +34,23 @@ ARXIV_DIR = os.path.join(_SCRIPT_DIR, "arxiv")
 FAISS_DATA_DIR = os.path.join(_SCRIPT_DIR, "faiss_data") # New directory for index/metadata
 FAISS_INDEX_PATH = os.path.join(FAISS_DATA_DIR, "arxiv_index.faiss") # Updated path
 METADATA_PATH = FAISS_INDEX_PATH + ".meta.json" # Updated path
-TARGET_EMBEDDING_LAYER = 10  # Example layer, adjust as needed
+# TARGET_EMBEDDING_LAYER = 20  # Example layer, adjust as needed
+# TARGET_EMBEDDING_LAYER = None # This will be set based on SAE layer
 CHUNK_SIZE = 500  # Characters per chunk
 CHUNK_OVERLAP = 50  # Overlap between chunks
+DEFAULT_STEERING_STRENGTH = 2.0 # Default strength for random steering
 
 # --- Global Application State (Initialized on Startup) ---
 # These are managed by FastAPI startup/shutdown events
-MODEL = None
-TOKENIZER = None
-EMBED_FUNCTION = None  # Function signature: (model, tokenizer, text, layer) -> embedding
+SAE_MODEL: SAEModel | None = None # Single instance of our SAEModel
 EMBEDDING_DIM = None # Dynamically determined from the model
+TARGET_EMBEDDING_LAYER = None # Dynamically determined from SAE
+
+# Baseline Model (for indexing and standard search)
+BASELINE_MODEL = None
+BASELINE_TOKENIZER = None
+BASELINE_EMBED_FUNCTION = None
+
 FAISS_INDEX = None     # faiss.Index
 STORED_METADATA = []   # List[dict] - [{"source": str, "text": str, "chunk_index": int, "faiss_index": int}]
 
@@ -55,52 +66,47 @@ app = FastAPI(title="Steering Search Backend", version="0.1.0")
 
 # --- Startup and Shutdown Logic ---
 
-
-def _load_model_and_tokenizer():
-    """Loads the embedding model and tokenizer."""
-    global MODEL, TOKENIZER, EMBED_FUNCTION
-    logger.info("Loading embedding model...")
+def _load_sae_model():
+    """Loads the SAE model and determines embedding dimension."""
+    global SAE_MODEL, EMBEDDING_DIM, TARGET_EMBEDDING_LAYER
+    logger.info("Loading SAE model...")
     try:
-        MODEL, TOKENIZER, EMBED_FUNCTION, model_name = load_embedding_model()
-        logger.info(f"Model {model_name} loaded successfully.")
+        SAE_MODEL = SAEModel() # Instantiate the class
+        if SAE_MODEL.model is None or SAE_MODEL.sae is None:
+             raise RuntimeError("SAEModel initialization failed (model or SAE is None).")
+        # Determine embedding dimension from the SAE's input dimension
+        EMBEDDING_DIM = SAE_MODEL.sae.cfg.d_in
+        # Set the target layer based on the loaded SAE
+        TARGET_EMBEDDING_LAYER = SAE_MODEL.sae.cfg.hook_layer
+        logger.info(f"SAEModel loaded. Target Layer: {TARGET_EMBEDDING_LAYER}, Embedding Dim: {EMBEDDING_DIM}")
         return True
     except Exception as e:
-        logger.error(f"Fatal error loading embedding model: {e}", exc_info=True)
+        logger.error(f"Fatal error loading SAE model: {e}", exc_info=True)
         return False
 
-def _determine_embedding_dim() -> bool:
-    """Determines the embedding dimension from the loaded model."""
-    global EMBEDDING_DIM
-    if not MODEL or not TOKENIZER or not EMBED_FUNCTION:
-        logger.error("Cannot determine embedding dimension: Model/tokenizer not loaded.")
-        return False
-
-    logger.info("Determining embedding dimension...")
-    dummy_text = "dimension check"
+def _load_baseline_model():
+    """Loads the baseline embedding model using embed.py."""
+    global BASELINE_MODEL, BASELINE_TOKENIZER, BASELINE_EMBED_FUNCTION
+    logger.info("Loading baseline embedding model (via embed.py)...")
     try:
-        dummy_embedding = EMBED_FUNCTION(MODEL, TOKENIZER, dummy_text, TARGET_EMBEDDING_LAYER)
-
-        # Convert to numpy and get shape
-        if _MLX_AVAILABLE and EMBED_FUNCTION.__name__ == 'embed_mlx':
-            emb_np = np.array(dummy_embedding)
-        elif _TORCH_AVAILABLE and EMBED_FUNCTION.__name__ == 'embed_torch':
-            emb_np = dummy_embedding.cpu().numpy()
-        else:
-            raise RuntimeError("Unknown embedding function type during dimension check.")
-
-        if emb_np.ndim < 1:
-             raise ValueError(f"Unexpected embedding shape: {emb_np.shape}")
-
-        EMBEDDING_DIM = emb_np.shape[-1]
-        logger.info(f"Determined embedding dimension: {EMBEDDING_DIM}")
+        BASELINE_MODEL, BASELINE_TOKENIZER, BASELINE_EMBED_FUNCTION, model_name = load_embedding_model()
+        if not all([BASELINE_MODEL, BASELINE_TOKENIZER, BASELINE_EMBED_FUNCTION]):
+            raise RuntimeError("Failed to load one or more baseline model components.")
+        logger.info(f"Baseline model ({model_name}) loaded successfully.")
+        # Optionally, add validation for TARGET_EMBEDDING_LAYER against this model here
+        # e.g., check max layers if possible
         return True
     except Exception as e:
-        logger.error(f"Error determining embedding dimension: {e}", exc_info=True)
+        logger.error(f"Fatal error loading baseline embedding model: {e}", exc_info=True)
         return False
 
 def _load_or_initialize_index_and_metadata():
     """Loads existing FAISS index and metadata or initializes new ones."""
     global FAISS_INDEX, STORED_METADATA
+
+    if EMBEDDING_DIM is None:
+        logger.error("Cannot load/initialize index: Embedding dimension not set.")
+        return False
 
     # --- Ensure FAISS data directory exists --- #
     os.makedirs(FAISS_DATA_DIR, exist_ok=True)
@@ -157,11 +163,13 @@ def _load_or_initialize_index_and_metadata():
 def startup_event():
     """FastAPI startup event: Load model, determine dimension, load/init index."""
     logger.info("--- Server Startup Sequence Initiated ---")
-    if not _load_model_and_tokenizer():
-        raise RuntimeError("Failed to load embedding model. Server cannot start.")
-
-    if not _determine_embedding_dim():
+    # Load SAE first to determine layer and dimension
+    if not _load_sae_model():
          raise RuntimeError("Failed to determine embedding dimension. Server cannot start.")
+
+    # Load baseline model (for indexing/standard search)
+    if not _load_baseline_model():
+         raise RuntimeError("Failed to load baseline embedding model. Server cannot start.")
 
     if not _load_or_initialize_index_and_metadata():
         # This function currently always returns True, but for future-proofing:
@@ -252,31 +260,39 @@ def _read_pdf_text(file_path: str) -> str:
         raise IOError(f"Failed to read PDF: {os.path.basename(file_path)}") from e
 
 def _embed_chunks(text_chunks: list[str], filename: str) -> tuple[list[np.ndarray], list[dict]]:
-    """Embeds text chunks using the global model and handles averaging."""
+    """
+    Embeds text chunks using the global SAE_MODEL's activation layer.
+    Averages the activations across the sequence length for each chunk.
+    """
     embeddings_list = []
     chunk_metadata_list = []
-    logger.info(f"Embedding {len(text_chunks)} chunks for {filename} using layer {TARGET_EMBEDDING_LAYER}...")
+    if not SAE_MODEL or not SAE_MODEL.model or not SAE_MODEL.sae:
+         logger.error("SAE_MODEL not initialized during embedding.")
+         return [], [] # Return empty if model isn't ready
+
+    # Use the baseline embedding function
+    if not BASELINE_MODEL or not BASELINE_TOKENIZER or not BASELINE_EMBED_FUNCTION:
+         logger.error("Baseline model not initialized during embedding.")
+          return [], [] # Return empty if model isn't ready
+
+    logger.info(f"Embedding {len(text_chunks)} chunks for {filename} using baseline model at layer {TARGET_EMBEDDING_LAYER}...")
 
     for i, chunk in enumerate(text_chunks):
         if not chunk.strip():
             continue # Skip empty chunks
 
         try:
-            hidden_states = EMBED_FUNCTION(MODEL, TOKENIZER, chunk, TARGET_EMBEDDING_LAYER)
+            # Use the baseline embedding function
+            hidden_states = BASELINE_EMBED_FUNCTION(BASELINE_MODEL, BASELINE_TOKENIZER, chunk, TARGET_EMBEDDING_LAYER)
 
-            # Convert to numpy float32
-            if _MLX_AVAILABLE and EMBED_FUNCTION.__name__ == 'embed_mlx':
-                emb_np = np.array(hidden_states, dtype=np.float32)
-            elif _TORCH_AVAILABLE and EMBED_FUNCTION.__name__ == 'embed_torch':
-                emb_np = hidden_states.cpu().numpy().astype(np.float32)
-            else:
-                raise RuntimeError("Unknown embedding function type during processing.")
+            # Activations shape: [batch=1, sequence_length, d_model]
+            chunk_activations = hidden_states
+            emb_np = chunk_activations.cpu().numpy().astype(np.float32)
 
-            # Average sequence length dimension if necessary -> (embedding_dim,)
-            if emb_np.ndim == 3 and emb_np.shape[0] == 1:
+            # Average across the sequence length dimension -> (embedding_dim,)
+            # Handle potential empty sequences if needed (though unlikely with text chunks)
+            if emb_np.shape[1] > 0: # Check sequence length > 0
                 avg_embedding = np.mean(emb_np[0, :, :], axis=0)
-            elif emb_np.ndim == 2:
-                avg_embedding = np.mean(emb_np, axis=0)
             elif emb_np.ndim == 1:
                 avg_embedding = emb_np
             else:
@@ -342,7 +358,7 @@ def _process_pdf_file(file_path: str) -> dict:
     logger.info(f"--- Starting processing for: {filename} ---")
 
     # Pre-check for server readiness (should always be true if called after startup)
-    if MODEL is None or TOKENIZER is None or EMBED_FUNCTION is None or FAISS_INDEX is None:
+    if BASELINE_MODEL is None or FAISS_INDEX is None:
         logger.error("Model or FAISS index not initialized during processing call.")
         # Indicate a server state issue, not just a file issue
         raise RuntimeError("Server components not ready. Check startup logs.")
@@ -512,7 +528,7 @@ def process_document(filename: str):
 def trigger_index_all(background_tasks: BackgroundTasks): # Add BackgroundTasks dependency
     """Triggers the indexing of all PDFs in the background."""
     # Check if server is ready before scheduling the task
-    if MODEL is None or TOKENIZER is None or EMBED_FUNCTION is None or FAISS_INDEX is None:
+    if BASELINE_MODEL is None or FAISS_INDEX is None:
         logger.error("Cannot start indexing task. Server components not ready.")
         # Return error immediately, don't schedule task
         raise HTTPException(status_code=503, detail="Server not fully initialized. Cannot start indexing.") # 503 Service Unavailable
@@ -539,47 +555,54 @@ def read_root():
 def search_documents(request: SearchRequest):
     global FAISS_INDEX, STORED_METADATA
 
-    if MODEL is None or TOKENIZER is None or EMBED_FUNCTION is None or FAISS_INDEX is None:
+    if BASELINE_MODEL is None or FAISS_INDEX is None:
         logger.error("Model or FAISS index not initialized. Cannot perform search.")
         raise HTTPException(status_code=500, detail="Server not ready. Model or index not initialized.")
     if FAISS_INDEX.ntotal == 0:
         logger.info("No documents processed yet. Cannot perform search.")
         return {"message": "No documents have been processed yet.", "results": []}
+    if not request.query.strip():
+        logger.info("Received empty search query.")
+        raise HTTPException(status_code=400, detail="Search query cannot be empty.")
 
     try:
         logger.info(f"Embedding search query: '{request.query}'")
-        # Embed the query
-        query_hidden_states = EMBED_FUNCTION(MODEL, TOKENIZER, request.query, TARGET_EMBEDDING_LAYER)
+
+        # Embed query using baseline model
+        query_hidden_states = BASELINE_EMBED_FUNCTION(
+            BASELINE_MODEL, BASELINE_TOKENIZER, request.query, TARGET_EMBEDDING_LAYER
+        )
 
         # Convert query embedding to numpy float32 and average sequence dimension
-        if _MLX_AVAILABLE and EMBED_FUNCTION.__name__ == 'embed_mlx':
-            query_emb_np = np.array(query_hidden_states, dtype=np.float32)
-        elif _TORCH_AVAILABLE and EMBED_FUNCTION.__name__ == 'embed_torch':
-            query_emb_np = query_hidden_states.cpu().numpy().astype(np.float32)
+        if _MLX_AVAILABLE and BASELINE_EMBED_FUNCTION.__name__ == 'embed_mlx':
+            query_emb_np_full = np.array(query_hidden_states, dtype=np.float32)
+        elif _TORCH_AVAILABLE and BASELINE_EMBED_FUNCTION.__name__ == 'embed_torch':
+            query_emb_np_full = query_hidden_states.cpu().numpy().astype(np.float32)
         else:
             raise RuntimeError("Unknown embedding function type during search.")
 
-        # Average sequence length dimension if necessary
-        if query_emb_np.ndim == 3 and query_emb_np.shape[0] == 1:
-            query_vector = np.mean(query_emb_np[0, :, :], axis=0)
-        elif query_emb_np.ndim == 2:
-            query_vector = np.mean(query_emb_np, axis=0)
-        elif query_emb_np.ndim == 1:
-            query_vector = query_emb_np
+        # Average sequence dimension -> (embedding_dim,)
+        if query_emb_np_full.shape[1] > 0:
+             query_vector_avg = np.mean(query_emb_np_full[0, :, :], axis=0)
         else:
-             raise ValueError(f"Unexpected query embedding shape: {query_emb_np.shape}")
+             logger.warning(f"Query '{request.query}' resulted in empty sequence embedding. Using zeros.")
+             query_vector_avg = np.zeros(EMBEDDING_DIM, dtype=np.float32)
 
-        # Ensure query vector is 2D for FAISS search
-        query_vector = query_vector.reshape(1, -1)
+        # Ensure the final vector has the correct shape for FAISS
+        if query_vector_avg.shape != (EMBEDDING_DIM,):
+             raise ValueError(f"Unexpected averaged query embedding shape: {query_vector_avg.shape}. Expected: ({EMBEDDING_DIM},)")
+
+        # Reshape for FAISS search (needs 2D array: [1, embedding_dim])
+        query_emb_np_final = query_vector_avg.reshape(1, -1)
 
         # Perform FAISS search
         logger.info(f"Searching index with {FAISS_INDEX.ntotal} vectors for top {request.top_k} results.")
-        distances, indices = FAISS_INDEX.search(query_vector, request.top_k)
+        distances, indices = FAISS_INDEX.search(query_emb_np_final, request.top_k)
 
         # Process results
         results = []
         if indices.size > 0:
-            for i, idx in enumerate(indices[0]): # indices[0] contains the results for the single query vector
+            for i, idx in enumerate(indices[0]):
                 if idx != -1: # FAISS returns -1 for padding if fewer results than k are found
                     results.append({
                         "score": float(distances[0][i]), # For L2 index, distance is squared L2. Lower is better.
@@ -592,6 +615,95 @@ def search_documents(request: SearchRequest):
     except Exception as e:
         logger.error(f"Error during search for query '{request.query}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to perform search: {str(e)}")
+
+# --- Steered Search Endpoint ---
+
+@app.post("/steered_search")
+def steered_search_documents(request: SearchRequest): # Using SearchRequest for now
+    global FAISS_INDEX, STORED_METADATA, SAE_MODEL
+
+    if SAE_MODEL is None or FAISS_INDEX is None:
+        logger.error("Model or FAISS index not initialized. Cannot perform steered search.")
+        raise HTTPException(status_code=500, detail="Server not ready. Model or index not initialized.")
+    if FAISS_INDEX.ntotal == 0:
+        logger.info("No documents processed yet. Cannot perform steered search.")
+        return {"message": "No documents have been processed yet.", "results": []}
+    if not request.query.strip():
+        logger.info("Received empty search query for steered search.")
+        raise HTTPException(status_code=400, detail="Search query cannot be empty.")
+
+    # --- Random Feature Selection ---
+    feature_id = None
+    explanation = "No features available for steering."
+    try:
+        if SAE_MODEL.explanations_df is not None and not SAE_MODEL.explanations_df.empty:
+            available_features = SAE_MODEL.explanations_df['feature'].unique()
+            if len(available_features) > 0:
+                feature_id = random.choice(available_features)
+                # Get the first explanation for this feature
+                explanation_rows = SAE_MODEL.explanations_df[SAE_MODEL.explanations_df['feature'] == feature_id]
+                if not explanation_rows.empty:
+                    explanation = explanation_rows['description'].iloc[0]
+                else:
+                    explanation = "Explanation not found for selected feature."
+                logger.info(f"Randomly selected feature {feature_id} for steering. Explanation: {explanation}")
+            else:
+                 logger.warning("Explanations DataFrame is loaded but contains no unique features.")
+        else:
+            logger.warning("Cannot select random feature: Explanations DataFrame not loaded or empty.")
+
+    except Exception as e:
+         logger.error(f"Error selecting random feature: {e}", exc_info=True)
+         # Continue without steering if feature selection fails
+         feature_id = None
+         explanation = "Error selecting steering feature."
+
+    # --- Perform Search (Steered if feature available, otherwise fallback to normal) ---
+    try:
+        if feature_id is not None:
+            logger.info(f"Embedding steered query: '{request.query}', Feature: {feature_id}, Strength: {DEFAULT_STEERING_STRENGTH}")
+            query_activation_tensor = SAE_MODEL.get_steered_activation(
+                request.query, feature_id, DEFAULT_STEERING_STRENGTH
+            )
+        else:
+            logger.warning("Performing non-steered search as no feature was selected.")
+            query_activation_tensor = SAE_MODEL.get_activation(request.query)
+
+        # Convert tensor to numpy for FAISS
+        query_emb_np = query_activation_tensor.cpu().numpy().astype('float32')
+        if query_emb_np.shape != (1, EMBEDDING_DIM):
+            query_emb_np = query_activation_tensor.cpu().numpy().astype('float32')
+            if query_emb_np.shape != (1, EMBEDDING_DIM):
+                raise ValueError(f"Unexpected query activation shape: {query_emb_np.shape}. Expected: (1, {EMBEDDING_DIM})")
+
+        # FAISS search
+        logger.info(f"Searching index with {FAISS_INDEX.ntotal} vectors for top {request.top_k} results.")
+        distances, indices = FAISS_INDEX.search(query_emb_np, request.top_k)
+
+        # Process results
+        results = []
+        if indices.size > 0:
+            for i, idx in enumerate(indices[0]):
+                if idx != -1:
+                    results.append({
+                        "score": float(distances[0][i]),
+                        "metadata": STORED_METADATA[idx]
+                    })
+
+        logger.info(f"Steered search completed. Found {len(results)} results.")
+        return {
+            "query": request.query,
+            "steering_info": {
+                "feature_id": feature_id if feature_id is not None else "None",
+                "strength": DEFAULT_STEERING_STRENGTH if feature_id is not None else 0,
+                "explanation": explanation
+            },
+            "results": results
+        }
+
+    except Exception as e:
+        logger.error(f"Error during steered search for query '{request.query}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to perform steered search: {str(e)}")
 
 # If you want to run this directly using uvicorn for testing:
 # You would typically run this from the command line:

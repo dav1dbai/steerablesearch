@@ -128,7 +128,7 @@ def load_embedding_model():
 
 if __name__ == "__main__":
     text = "What is the most important thing to know about the brain? indeed, it is the most important thing to know about the brain?"
-    target_layer = 10 # Example layer index
+    target_layer = 20 # Example layer index
 
     # --- Load Model using the new function ---
     try:
