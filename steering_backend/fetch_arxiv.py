@@ -59,7 +59,7 @@ def setup_argparse():
         help='Delay between API requests in seconds to avoid rate limiting (recommended: 3.0)'
     )
     parser.add_argument(
-        '--max-workers', type=int, default=10,
+        '--max-workers', type=int, default=20,
         help='Maximum number of parallel download threads (default: 10)'
     )
     return parser
@@ -130,7 +130,14 @@ def download_paper_task(result, pdf_dir):
     numeric_id = result.get_short_id().split('/')[-1]
     filename_base = numeric_id
     pdf_filename = f"{filename_base}.pdf"
+    pdf_path = os.path.join(pdf_dir, pdf_filename)  # Construct the full path
     pdf_status = "Not Downloaded"
+
+    # Check if the file already exists
+    if os.path.exists(pdf_path):
+        pdf_status = "Skipped (Already Exists)"
+        return result, pdf_status, filename_base
+
     try:
         result.download_pdf(dirpath=pdf_dir, filename=pdf_filename)
         pdf_status = "Success"
@@ -202,6 +209,7 @@ def main():
     # --- Parallel Download ---    
     count_success = 0
     count_failed = 0
+    count_skipped = 0 # Add a counter for skipped files
     start_download_time = time.time()
     log_lock = threading.Lock()
 
@@ -224,8 +232,11 @@ def main():
                 try:
                     result_obj, pdf_status, filename_base = future.result()
                     
+                    # Update counters based on status
                     if pdf_status == "Success":
                         count_success += 1
+                    elif pdf_status.startswith("Skipped"):
+                         count_skipped += 1 # Increment skipped counter
                     else:
                         count_failed += 1
 
@@ -245,7 +256,7 @@ def main():
                     # Update progress on screen
                     elapsed_download = time.time() - start_download_time
                     papers_per_sec = processed_count / elapsed_download if elapsed_download > 0 else 0
-                    print(f"\rProgress: {processed_count}/{actual_results_count} ({count_success} success, {count_failed} failed) | Speed: {papers_per_sec:.2f} papers/sec", end="")
+                    print(f"\rProgress: {processed_count}/{actual_results_count} ({count_success} success, {count_failed} failed, {count_skipped} skipped) | Speed: {papers_per_sec:.2f} papers/sec", end="")
 
                 except Exception as exc:
                     count_failed += 1
@@ -258,7 +269,7 @@ def main():
 
     # --- Final Summary ---                
     total_elapsed = time.time() - start_fetch_time
-    print(f"\n\nDownload complete! {count_success} successful, {count_failed} failed.")
+    print(f"\n\nDownload complete! {count_success} successful, {count_failed} failed, {count_skipped} skipped.")
     print(f"Total time: {total_elapsed / 60:.1f} minutes ({fetch_time:.1f}s fetch + {(total_elapsed - fetch_time):.1f}s download).")
     print(f"Log file saved to: {log_file}")
     print(f"PDF files saved to: {pdf_dir}")

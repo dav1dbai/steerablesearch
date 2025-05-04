@@ -29,7 +29,7 @@ if not _MLX_AVAILABLE:
 # --- MLX Embedding Function ---
 def embed_mlx(model, tokenizer, text, layer_index):
     '''
-    Embed a text query using the MLX model and return intermediate activations.
+    Embed a text query using the MLX model and return intermediate activations as NumPy array.
     (Assumes _MLX_AVAILABLE is True)
     '''
     encoded_output = tokenizer.encode(text)
@@ -58,12 +58,12 @@ def embed_mlx(model, tokenizer, text, layer_index):
         hidden_states = model.model.layers[i](hidden_states, mask=None, cache=None)
 
     mx.eval(hidden_states)
-    return hidden_states # Returns mx.array
+    return np.array(hidden_states) # Convert to numpy before returning
 
 # --- PyTorch Embedding Function ---
 def embed_torch(model, tokenizer, text, layer_index):
     '''
-    Embed a text query using the PyTorch model and return intermediate activations.
+    Embed a text query using the PyTorch model and return intermediate activations as NumPy array.
     (Assumes _TORCH_AVAILABLE is True)
     '''
     # Ensure model is on CPU for consistency in this example
@@ -78,7 +78,8 @@ def embed_torch(model, tokenizer, text, layer_index):
     if layer_index < 0 or layer_index >= len(outputs.hidden_states):
       raise ValueError(f"Layer index {layer_index} is out of bounds. Model has {len(outputs.hidden_states)} hidden states (incl. embeddings).")
 
-    return outputs.hidden_states[layer_index] # Returns torch.Tensor
+    # Convert to CPU numpy array before returning
+    return outputs.hidden_states[layer_index].cpu().numpy()
 
 
 def load_embedding_model():
@@ -137,52 +138,26 @@ if __name__ == "__main__":
         print(e)
         exit(1)
     # --- Model is already loaded here ---
-    # model = None
-    # tokenizer = None
-    # embed_function = None
-
-    # # --- Load Model and Select Function based on Platform ---
-    # if _MLX_AVAILABLE:
-    #     print("Using MLX backend.")
-    #     # Use the IT variant for consistency if available, otherwise base.
-    #     # Check if mlx-community/gemma-2-2b-it exists, use it, else use mlx-community/gemma-2-2b
-    #     model_name = "mlx-community/gemma-2-2b" # Prefer instruction-tuned
-    #     # Add try-except for loading specific model if needed
-    #     print(f"Loading MLX model: {model_name}")
-    #     model, tokenizer = mlx_lm.load(model_name)
-    #     embed_function = embed_mlx
-
-    # elif _TORCH_AVAILABLE:
-    #     print("Using PyTorch backend.")
-    #     model_name = "google/gemma-2-2b" # Use instruction-tuned for PyTorch
-    #     print(f"Loading PyTorch model: {model_name}")
-    #     # Load with AutoModel for intermediate layers, not AutoModelForCausalLM
-    #     model = transformers.AutoModel.from_pretrained(model_name)
-    #     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
-    #     embed_function = embed_torch
-    # else:
-    #     raise RuntimeError("No suitable backend (MLX or PyTorch) found. Please install required libraries.")
-
-    # print("Model loaded.") # Moved inside load_embedding_model
 
     print("Beginning inference")
     start = time.time()
 
     # --- Run Inference ---
-    hidden_states_output = embed_function(model, tokenizer, text, target_layer)
+    # The embed_function now returns a numpy array directly
+    hidden_states_np = embed_function(model, tokenizer, text, target_layer)
 
     end = time.time()
     print(f"Time taken: {end - start:.4f} seconds")
 
     # --- Process Output ---
-    # Convert to numpy for consistent handling
-    if _MLX_AVAILABLE and embed_function == embed_mlx:
-         hidden_states_np = np.array(hidden_states_output)
-    elif _TORCH_AVAILABLE and embed_function == embed_torch:
-         hidden_states_np = hidden_states_output.cpu().numpy()
-    else:
-         # Should not happen based on checks above
-         hidden_states_np = np.array(hidden_states_output)
+    # No conversion needed here anymore
+    # if _MLX_AVAILABLE and embed_function == embed_mlx:
+    #      hidden_states_np = np.array(hidden_states_output)
+    # elif _TORCH_AVAILABLE and embed_function == embed_torch:
+    #      hidden_states_np = hidden_states_output.cpu().numpy()
+    # else:
+    #      # Should not happen based on checks above
+    #      hidden_states_np = np.array(hidden_states_output)
 
     print(f"Shape of hidden states from layer {target_layer}: {hidden_states_np.shape}")
     # Optionally print the hidden states (can be very large)

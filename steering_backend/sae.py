@@ -120,7 +120,8 @@ class SAEModel:
              return pd.DataFrame(columns=['feature', 'description'])
 
         logging.info(f"Loading explanations for {self.model_name} / {self.neuronpedia_layer_id} from Neuronpedia...")
-        url = f"https://www.neuronpedia.org/api/explanation/export?modelId={self.model_name}&saeId={self.neuronpedia_layer_id}"
+        model_name = self.model_name.split('/')[-1]
+        url = f"https://www.neuronpedia.org/api/explanation/export?modelId={model_name}&saeId={self.neuronpedia_layer_id}"
         headers = {"Content-Type": "application/json"}
         try:
             response = requests.get(url, headers=headers, timeout=30) # Add timeout
@@ -224,7 +225,8 @@ class SAEModel:
     def get_feature_max_activation(self, feature_id: int):
         """Fetches the maximum activation for a feature from Neuronpedia."""
         logging.info(f"Fetching max activation for feature {feature_id} from Neuronpedia...")
-        feature_url = f"https://www.neuronpedia.org/api/feature/{self.model_name}/{self.neuronpedia_layer_id}/{feature_id}"
+        model_name = self.model_name.split('/')[-1]
+        feature_url = f"https://www.neuronpedia.org/api/feature/{model_name}/{self.neuronpedia_layer_id}/{feature_id}"
         max_act = 1.0 # Default value
 
         try:

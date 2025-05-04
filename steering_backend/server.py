@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import random
+import math # Add math import for ceiling division
+from typing import List, Dict, Union, Any # Add List, Dict, Union, Any
 
 # Third-party Imports
 import faiss
@@ -22,6 +24,7 @@ from embed import (load_embedding_model,
                    embed_mlx, embed_torch, # Keep specific functions if needed for type check
                    _MLX_AVAILABLE, _TORCH_AVAILABLE) # Import availability flags
 import torch # Need torch for tensor operations
+import mlx.core # Add missing import
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO)
@@ -36,8 +39,10 @@ FAISS_INDEX_PATH = os.path.join(FAISS_DATA_DIR, "arxiv_index.faiss") # Updated p
 METADATA_PATH = FAISS_INDEX_PATH + ".meta.json" # Updated path
 # TARGET_EMBEDDING_LAYER = 20  # Example layer, adjust as needed
 # TARGET_EMBEDDING_LAYER = None # This will be set based on SAE layer
-CHUNK_SIZE = 500  # Characters per chunk
-CHUNK_OVERLAP = 50  # Overlap between chunks
+CHUNK_SIZE = 500  # Preferred characters per chunk
+CHUNK_OVERLAP = 50  # Preferred overlap between chunks
+MAX_CHUNKS = 100 # Maximum desired number of chunks per document
+CHUNK_COUNT_TOLERANCE = 10 # Allow up to MAX_CHUNKS + TOLERANCE from initial chunking
 DEFAULT_STEERING_STRENGTH = 2.0 # Default strength for random steering
 
 # --- Global Application State (Initialized on Startup) ---
@@ -59,6 +64,15 @@ STORED_METADATA = []   # List[dict] - [{"source": str, "text": str, "chunk_index
 class SearchRequest(BaseModel):
     query: str
     top_k: int = 5
+
+# Define a model for a single steering parameter
+class SteeringParam(BaseModel):
+    feature_id: int
+    strength: float
+
+class SteeredSearchRequest(SearchRequest): # Inherit from SearchRequest
+    # Replace single feature_id/strength with a list of parameters
+    steering_params: List[SteeringParam] | None = None
 
 
 # --- FastAPI Application Instance ---
@@ -232,16 +246,72 @@ def shutdown_event():
 # --- Text Processing Utilities ---
 
 def chunk_text(text: str, size: int, overlap: int) -> list[str]:
-    """Simple text chunking function."""
+    """Helper function for basic chunking with size and overlap."""
     if overlap >= size:
-        raise ValueError("Overlap must be smaller than chunk size.")
+        # Prevent issues with overlap >= size
+        logger.warning(f"Overlap ({overlap}) >= size ({size}). Chunking without overlap.")
+        overlap = 0
+
     chunks = []
     start = 0
     while start < len(text):
         end = start + size
         chunks.append(text[start:end])
+        if end >= len(text):
+             break # Exit if we've reached the end
         start += size - overlap
+        # Ensure start doesn't go backwards if overlap is large relative to size (shouldn't happen with check above)
+        if start < 0: start = 0
     return chunks
+
+def process_and_chunk_text(text: str) -> list[str]:
+    """
+    Chunks text using CHUNK_SIZE and CHUNK_OVERLAP.
+    If the number of chunks exceeds MAX_CHUNKS + CHUNK_COUNT_TOLERANCE,
+    it re-chunks based on MAX_CHUNKS, trying to preserve CHUNK_OVERLAP.
+    """
+    total_length = len(text)
+    if total_length == 0:
+        return []
+
+    # Attempt 1: Chunk with preferred size and overlap
+    logger.info(f"Attempting chunking with size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}")
+    initial_chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+    initial_chunk_count = len(initial_chunks)
+
+    # Check if the initial chunk count is within acceptable limits
+    allowed_max_chunks = MAX_CHUNKS + CHUNK_COUNT_TOLERANCE
+    if initial_chunk_count <= allowed_max_chunks:
+        logger.info(
+            f"Initial chunking yielded {initial_chunk_count} chunks "
+            f"(<= allowed max {allowed_max_chunks}). Using this result."
+        )
+        return initial_chunks
+    else:
+        # Only re-chunk if significantly over the limit
+        logger.warning(
+            f"Initial chunking yielded {initial_chunk_count} chunks (> allowed max {allowed_max_chunks}). "
+            f"Re-chunking based on total length ({total_length}) / {MAX_CHUNKS}, preserving overlap if possible."
+        )
+
+        # Attempt 2: Calculate new size based on MAX_CHUNKS, keep overlap
+        new_size = math.ceil(total_length / MAX_CHUNKS)
+        effective_overlap = CHUNK_OVERLAP # Try to use preferred overlap
+
+        # Sanity check: If new_size is too small for the overlap, chunk without overlap
+        if new_size <= effective_overlap:
+             logger.warning(
+                 f"Calculated new chunk size ({new_size}) is <= overlap ({effective_overlap}). "
+                 f"Re-chunking with size {new_size} and NO overlap."
+             )
+             effective_overlap = 0 # Force overlap to 0
+        else:
+             logger.info(f"Re-chunking with calculated size={new_size}, overlap={effective_overlap}")
+
+        # Perform the second chunking attempt using the basic helper
+        final_chunks = chunk_text(text, new_size, effective_overlap)
+        logger.info(f"Re-chunking yielded {len(final_chunks)} chunks.")
+        return final_chunks
 
 # --- Helper function for processing a single PDF ---
 
@@ -270,10 +340,9 @@ def _embed_chunks(text_chunks: list[str], filename: str) -> tuple[list[np.ndarra
          logger.error("SAE_MODEL not initialized during embedding.")
          return [], [] # Return empty if model isn't ready
 
-    # Use the baseline embedding function
     if not BASELINE_MODEL or not BASELINE_TOKENIZER or not BASELINE_EMBED_FUNCTION:
          logger.error("Baseline model not initialized during embedding.")
-          return [], [] # Return empty if model isn't ready
+         return [], [] # Return empty if model isn't ready
 
     logger.info(f"Embedding {len(text_chunks)} chunks for {filename} using baseline model at layer {TARGET_EMBEDDING_LAYER}...")
 
@@ -286,8 +355,9 @@ def _embed_chunks(text_chunks: list[str], filename: str) -> tuple[list[np.ndarra
             hidden_states = BASELINE_EMBED_FUNCTION(BASELINE_MODEL, BASELINE_TOKENIZER, chunk, TARGET_EMBEDDING_LAYER)
 
             # Activations shape: [batch=1, sequence_length, d_model]
+            # Assuming BASELINE_EMBED_FUNCTION returns a type directly convertible to NumPy (e.g., MLX array or list/NumPy already)
             chunk_activations = hidden_states
-            emb_np = chunk_activations.cpu().numpy().astype(np.float32)
+            emb_np = np.array(chunk_activations).astype(np.float32)
 
             # Average across the sequence length dimension -> (embedding_dim,)
             # Handle potential empty sequences if needed (though unlikely with text chunks)
@@ -357,6 +427,18 @@ def _process_pdf_file(file_path: str) -> dict:
     filename = os.path.basename(file_path)
     logger.info(f"--- Starting processing for: {filename} ---")
 
+    # --- Check if already indexed --- #
+    global STORED_METADATA
+    # This is a linear scan; might be slow for very large metadata. Optimize if needed.
+    if any(meta.get('source') == filename for meta in STORED_METADATA):
+        logger.info(f"Skipping {filename}: Already found in stored metadata.")
+        return {
+            "success": True, # Indicate success as the file exists in the index
+            "message": f"Skipped: {filename} already indexed.",
+            "chunks_added": 0 # No chunks added *in this run*
+        }
+    # --- End Check --- #
+
     # Pre-check for server readiness (should always be true if called after startup)
     if BASELINE_MODEL is None or FAISS_INDEX is None:
         logger.error("Model or FAISS index not initialized during processing call.")
@@ -371,12 +453,12 @@ def _process_pdf_file(file_path: str) -> dict:
             return {"success": False, "message": f"No text content found in {filename}.", "chunks_added": 0}
 
         # 2. Chunk Text
-        logger.info(f"Chunking text (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})...")
-        text_chunks = chunk_text(full_text, CHUNK_SIZE, CHUNK_OVERLAP)
+        logger.info(f"Processing and chunking text (target size={CHUNK_SIZE}, max chunks={MAX_CHUNKS})...")
+        text_chunks = process_and_chunk_text(full_text) # Use the new processing function
         if not text_chunks:
              logger.warning(f"Text chunking resulted in zero chunks for {filename}. Skipping.")
              return {"success": False, "message": f"Text chunking yielded no results for {filename}.", "chunks_added": 0}
-        logger.info(f"Created {len(text_chunks)} chunks.")
+        logger.info(f"Created {len(text_chunks)} actual chunks for {filename}.") # Log actual final number
 
         # 3. Embed Chunks
         embeddings_list, chunk_metadata = _embed_chunks(text_chunks, filename)
@@ -619,7 +701,7 @@ def search_documents(request: SearchRequest):
 # --- Steered Search Endpoint ---
 
 @app.post("/steered_search")
-def steered_search_documents(request: SearchRequest): # Using SearchRequest for now
+def steered_search_documents(request: SteeredSearchRequest):
     global FAISS_INDEX, STORED_METADATA, SAE_MODEL
 
     if SAE_MODEL is None or FAISS_INDEX is None:
@@ -632,49 +714,81 @@ def steered_search_documents(request: SearchRequest): # Using SearchRequest for 
         logger.info("Received empty search query for steered search.")
         raise HTTPException(status_code=400, detail="Search query cannot be empty.")
 
-    # --- Random Feature Selection ---
-    feature_id = None
-    explanation = "No features available for steering."
+    # --- Get Base Activation ---
     try:
-        if SAE_MODEL.explanations_df is not None and not SAE_MODEL.explanations_df.empty:
-            available_features = SAE_MODEL.explanations_df['feature'].unique()
-            if len(available_features) > 0:
-                feature_id = random.choice(available_features)
-                # Get the first explanation for this feature
-                explanation_rows = SAE_MODEL.explanations_df[SAE_MODEL.explanations_df['feature'] == feature_id]
-                if not explanation_rows.empty:
-                    explanation = explanation_rows['description'].iloc[0]
-                else:
-                    explanation = "Explanation not found for selected feature."
-                logger.info(f"Randomly selected feature {feature_id} for steering. Explanation: {explanation}")
-            else:
-                 logger.warning("Explanations DataFrame is loaded but contains no unique features.")
-        else:
-            logger.warning("Cannot select random feature: Explanations DataFrame not loaded or empty.")
+        logger.info(f"Getting base activation for query: '{request.query}'")
+        # Use the SAE model's method to get activation at the correct layer
+        base_activation_tensor = SAE_MODEL.get_activation(request.query)
+        # Ensure it's on the correct device (matching SAE_MODEL.device)
+        base_activation_tensor = base_activation_tensor.to(SAE_MODEL.device)
+        logger.info(f"Base activation shape: {base_activation_tensor.shape}")
 
     except Exception as e:
-         logger.error(f"Error selecting random feature: {e}", exc_info=True)
-         # Continue without steering if feature selection fails
-         feature_id = None
-         explanation = "Error selecting steering feature."
+        logger.error(f"Error getting base activation for query '{request.query}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get base activation: {str(e)}")
 
-    # --- Perform Search (Steered if feature available, otherwise fallback to normal) ---
+
+    # --- Calculate Combined Steering Offset ---
+    total_steering_offset = torch.zeros_like(base_activation_tensor) # Initialize offset tensor on the same device
+    applied_steering_info = [] # Store details of features successfully applied
+
+    if request.steering_params:
+        logger.info(f"Processing {len(request.steering_params)} steering parameters...")
+        valid_feature_ids = set(SAE_MODEL.explanations_df['feature'].unique()) if SAE_MODEL.explanations_df is not None else set()
+
+        for param in request.steering_params:
+            feature_id = param.feature_id
+            strength = param.strength
+
+            if feature_id not in valid_feature_ids:
+                logger.warning(f"Requested steering feature {feature_id} not found or explanations not loaded. Skipping.")
+                continue
+
+            try:
+                # Get max activation for scaling
+                max_act = SAE_MODEL.get_feature_max_activation(feature_id)
+                if max_act is None or max_act == 0: # Handle cases where max_act is invalid
+                     logger.warning(f"Max activation for feature {feature_id} is invalid ({max_act}). Skipping feature.")
+                     continue
+
+                # Get the steering vector (decoder weight)
+                steering_vector = SAE_MODEL.sae.W_dec[feature_id]
+                steering_vector = steering_vector.to(total_steering_offset.device, dtype=total_steering_offset.dtype)
+
+                # Calculate offset for this feature
+                offset = strength * max_act * steering_vector
+                total_steering_offset += offset
+
+                # Log applied feature details
+                explanation_rows = SAE_MODEL.explanations_df[SAE_MODEL.explanations_df['feature'] == feature_id]
+                explanation = explanation_rows['description'].iloc[0] if not explanation_rows.empty else "Explanation not found."
+                applied_steering_info.append({
+                    "feature_id": feature_id,
+                    "strength": strength,
+                    "max_activation_used": max_act, # Include max_act used for scaling
+                    "explanation": explanation
+                })
+                logger.info(f"Applied steering for feature {feature_id} with strength {strength:.2f} (max_act={max_act:.4f})")
+
+            except Exception as e:
+                logger.error(f"Error processing steering for feature {feature_id}: {e}", exc_info=True)
+                # Decide whether to continue or raise an error for the whole request
+
+    # --- Apply Offset and Perform Search ---
     try:
-        if feature_id is not None:
-            logger.info(f"Embedding steered query: '{request.query}', Feature: {feature_id}, Strength: {DEFAULT_STEERING_STRENGTH}")
-            query_activation_tensor = SAE_MODEL.get_steered_activation(
-                request.query, feature_id, DEFAULT_STEERING_STRENGTH
-            )
-        else:
-            logger.warning("Performing non-steered search as no feature was selected.")
-            query_activation_tensor = SAE_MODEL.get_activation(request.query)
+        # Add the combined offset to the base activation
+        final_query_emb_tensor = base_activation_tensor + total_steering_offset
+        logger.info(f"Final query embedding shape after steering: {final_query_emb_tensor.shape}")
 
-        # Convert tensor to numpy for FAISS
-        query_emb_np = query_activation_tensor.cpu().numpy().astype('float32')
+        # Convert final tensor to numpy for FAISS
+        # Ensure shape is (1, EMBEDDING_DIM)
+        query_emb_np = final_query_emb_tensor.detach().numpy().astype('float32')
         if query_emb_np.shape != (1, EMBEDDING_DIM):
-            query_emb_np = query_activation_tensor.cpu().numpy().astype('float32')
-            if query_emb_np.shape != (1, EMBEDDING_DIM):
-                raise ValueError(f"Unexpected query activation shape: {query_emb_np.shape}. Expected: (1, {EMBEDDING_DIM})")
+             # Add potential reshaping logic if needed (e.g., if pooling was missed in get_activation)
+             if len(query_emb_np.shape) == 3 and query_emb_np.shape[0] == 1:
+                 query_emb_np = np.mean(query_emb_np[0, :, :], axis=0).reshape(1, -1)
+             if query_emb_np.shape != (1, EMBEDDING_DIM):
+                 raise ValueError(f"Unexpected final query embedding shape after potential pooling: {query_emb_np.shape}. Expected: (1, {EMBEDDING_DIM})")
 
         # FAISS search
         logger.info(f"Searching index with {FAISS_INDEX.ntotal} vectors for top {request.top_k} results.")
@@ -685,25 +799,50 @@ def steered_search_documents(request: SearchRequest): # Using SearchRequest for 
         if indices.size > 0:
             for i, idx in enumerate(indices[0]):
                 if idx != -1:
-                    results.append({
-                        "score": float(distances[0][i]),
-                        "metadata": STORED_METADATA[idx]
-                    })
+                    # Ensure metadata exists for the index
+                    if 0 <= idx < len(STORED_METADATA):
+                        results.append({
+                            "score": float(distances[0][i]),
+                            "metadata": STORED_METADATA[idx]
+                        })
+                    else:
+                         logger.warning(f"FAISS index {idx} is out of bounds for STORED_METADATA (size {len(STORED_METADATA)}). Skipping result.")
 
-        logger.info(f"Steered search completed. Found {len(results)} results.")
+
+        search_type = f"Steered ({len(applied_steering_info)} features)" if applied_steering_info else "Non-Steered"
+        logger.info(f"{search_type} search completed. Found {len(results)} results.")
+        # Update response structure
         return {
             "query": request.query,
-            "steering_info": {
-                "feature_id": feature_id if feature_id is not None else "None",
-                "strength": DEFAULT_STEERING_STRENGTH if feature_id is not None else 0,
-                "explanation": explanation
-            },
+            "steering_info": applied_steering_info, # Return list of applied features/strengths
             "results": results
         }
 
     except Exception as e:
-        logger.error(f"Error during steered search for query '{request.query}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to perform steered search: {str(e)}")
+        logger.error(f"Error during final embedding processing or FAISS search for query '{request.query}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to perform search: {str(e)}")
+
+# --- New Endpoint to Get Available Features ---
+@app.get("/features")
+def get_available_features():
+    """Returns a list of available steering features and their descriptions."""
+    global SAE_MODEL
+    if SAE_MODEL is None or SAE_MODEL.explanations_df is None or SAE_MODEL.explanations_df.empty:
+        logger.warning("Feature explanations not loaded or empty. Returning empty list.")
+        return [] # Return empty list if not available
+
+    try:
+        # Select relevant columns and drop duplicates based on feature ID
+        features_df = SAE_MODEL.explanations_df[['feature', 'description']].drop_duplicates(subset=['feature'])
+        # Convert to the desired list of dictionaries format
+        features_list = features_df.rename(columns={'feature': 'feature_id'}).to_dict('records')
+        # Sort by feature_id for consistency
+        features_list.sort(key=lambda x: x['feature_id'])
+        logger.info(f"Returning {len(features_list)} available features.")
+        return features_list
+    except Exception as e:
+        logger.error(f"Error retrieving features: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving feature list.")
 
 # If you want to run this directly using uvicorn for testing:
 # You would typically run this from the command line:
