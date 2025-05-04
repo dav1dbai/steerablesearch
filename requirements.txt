@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+numpy
+pypdf2 
+pydantic
+
+
+# faiss-cpu
+# ^ do this with conda on mac
+
+# For PyTorch embedding backend (embed.py)
+transformers
+
+# For MLX embedding backend (embed.py) - Optional, only needed on Apple Silicon
+mlx
+mlx-lm

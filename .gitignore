@@ -2,3 +2,5 @@
 arxiv/
 .env
 __pycache__/
+.venv/
+faiss_data/
