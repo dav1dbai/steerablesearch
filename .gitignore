@@ -4,3 +4,4 @@ arxiv/
 __pycache__/
 .venv/
 faiss_data/
+**/.claude/settings.local.json

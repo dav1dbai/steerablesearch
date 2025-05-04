@@ -3,7 +3,7 @@ uvicorn[standard]
 numpy
 pypdf2 
 pydantic
-
+requests
 
 # faiss-cpu
 # ^ do this with conda on mac

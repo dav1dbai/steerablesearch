@@ -9,22 +9,28 @@ import logging
 import os
 import random
 import math # Add math import for ceiling division
-from typing import List, Dict, Union, Any # Add List, Dict, Union, Any
+import re # For citation and noise filtering
+from typing import List, Dict, Union, Any, Optional, Tuple
 
 # Third-party Imports
 import faiss
 import numpy as np
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends, Body
+from fastapi.responses import JSONResponse
 from PyPDF2 import PdfReader
 from pydantic import BaseModel
 
 # Local Application Imports
 from sae import SAEModel  # Import the new SAEModel class
+from llm import ClaudeAPIClient  # Import Claude API client
 from embed import (load_embedding_model,
                    embed_mlx, embed_torch, # Keep specific functions if needed for type check
                    _MLX_AVAILABLE, _TORCH_AVAILABLE) # Import availability flags
 import torch # Need torch for tensor operations
 import mlx.core # Add missing import
+import dotenv
+
+dotenv.load_dotenv()
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO)
@@ -44,10 +50,15 @@ CHUNK_OVERLAP = 50  # Preferred overlap between chunks
 MAX_CHUNKS = 100 # Maximum desired number of chunks per document
 CHUNK_COUNT_TOLERANCE = 10 # Allow up to MAX_CHUNKS + TOLERANCE from initial chunking
 DEFAULT_STEERING_STRENGTH = 2.0 # Default strength for random steering
+MAX_FEATURES_TO_MATCH = 20  # Maximum number of features to pass to Claude for matching
+MAX_AUTO_STEERING_FEATURES = 5  # Maximum number of features to use for auto-steering
+MAX_STEERING_STRENGTH = 8.0  # Maximum steering strength for auto-steering
+ARXIV_BASE_URL = "https://arxiv.org/abs/"  # Base URL for arXiv papers
 
 # --- Global Application State (Initialized on Startup) ---
 # These are managed by FastAPI startup/shutdown events
 SAE_MODEL: SAEModel | None = None # Single instance of our SAEModel
+CLAUDE_CLIENT: ClaudeAPIClient | None = None # Single instance of Claude API client
 EMBEDDING_DIM = None # Dynamically determined from the model
 TARGET_EMBEDDING_LAYER = None # Dynamically determined from SAE
 
@@ -64,6 +75,8 @@ STORED_METADATA = []   # List[dict] - [{"source": str, "text": str, "chunk_index
 class SearchRequest(BaseModel):
     query: str
     top_k: int = 5
+    filter_noise: bool = True  # Option to filter out citation noise
+    rewrite_query: bool = False  # Option to use Claude to rewrite the query
 
 # Define a model for a single steering parameter
 class SteeringParam(BaseModel):
@@ -73,6 +86,12 @@ class SteeringParam(BaseModel):
 class SteeredSearchRequest(SearchRequest): # Inherit from SearchRequest
     # Replace single feature_id/strength with a list of parameters
     steering_params: List[SteeringParam] | None = None
+
+class AutoSteeredSearchRequest(SearchRequest):
+    # For auto-steered search, we don't need steering parameters
+    # But we might want additional control parameters
+    max_features: int = MAX_AUTO_STEERING_FEATURES
+    max_strength: float = MAX_STEERING_STRENGTH
 
 
 # --- FastAPI Application Instance ---
@@ -112,6 +131,22 @@ def _load_baseline_model():
         return True
     except Exception as e:
         logger.error(f"Fatal error loading baseline embedding model: {e}", exc_info=True)
+        return False
+
+def _load_claude_client():
+    """Loads the Claude API client."""
+    global CLAUDE_CLIENT
+    logger.info("Initializing Claude API client...")
+    try:
+        CLAUDE_CLIENT = ClaudeAPIClient()
+        # Check if API key is available
+        if not CLAUDE_CLIENT.api_key:
+            logger.warning("Claude API key not found. Auto-steering will not be available.")
+            return False
+        logger.info("Claude API client initialized successfully.")
+        return True
+    except Exception as e:
+        logger.error(f"Error initializing Claude API client: {e}", exc_info=True)
         return False
 
 def _load_or_initialize_index_and_metadata():
@@ -184,6 +219,9 @@ def startup_event():
     # Load baseline model (for indexing/standard search)
     if not _load_baseline_model():
          raise RuntimeError("Failed to load baseline embedding model. Server cannot start.")
+
+    # Initialize Claude API client
+    _load_claude_client()  # Non-critical, don't raise exception if fails
 
     if not _load_or_initialize_index_and_metadata():
         # This function currently always returns True, but for future-proofing:
@@ -346,6 +384,9 @@ def _embed_chunks(text_chunks: list[str], filename: str) -> tuple[list[np.ndarra
 
     logger.info(f"Embedding {len(text_chunks)} chunks for {filename} using baseline model at layer {TARGET_EMBEDDING_LAYER}...")
 
+    # Extract arXiv ID from filename
+    arxiv_id = os.path.splitext(filename)[0].split('v')[0]  # Remove extension and version
+
     for i, chunk in enumerate(text_chunks):
         if not chunk.strip():
             continue # Skip empty chunks
@@ -375,11 +416,13 @@ def _embed_chunks(text_chunks: list[str], filename: str) -> tuple[list[np.ndarra
                  continue
 
             embeddings_list.append(avg_embedding)
-            # Metadata is simpler here, faiss index added later
+            # Enhanced metadata with arXiv ID and paper URL
             chunk_metadata_list.append({
                 "source": filename,
                 "text": chunk,
-                "chunk_index": i
+                "chunk_index": i,
+                "arxiv_id": arxiv_id,
+                "paper_url": f"{ARXIV_BASE_URL}{arxiv_id}"
              })
 
         except Exception as e:
@@ -573,6 +616,81 @@ def index_all_arxiv_pdfs():
         "total_vectors_in_index": FAISS_INDEX.ntotal if FAISS_INDEX else 0
     }
 
+# --- Helper functions for paper result formatting and filtering ---
+
+def is_citation_or_noise(text: str) -> bool:
+    """
+    Determines if a text chunk is primarily citations or noise.
+    
+    Returns:
+        bool: True if the chunk contains primarily citations or noise, False otherwise
+    """
+    # Common patterns for citations
+    citation_patterns = [
+        r"\[\d+\]",       # [1], [2], etc.
+        r"\(\d{4}\)",     # (2020), (2021), etc.
+        r"et al\.",       # et al.
+        r"References",    # References section header
+        r"Bibliography",  # Bibliography section header
+    ]
+    
+    # Check for high density of citation patterns
+    citation_count = 0
+    for pattern in citation_patterns:
+        citation_count += len(re.findall(pattern, text))
+    
+    # If text has a high density of citations (more than 5 per 500 chars)
+    if citation_count > 5 and len(text) < 500:
+        return True
+        
+    # Check if the chunk is mostly references (starts with a number and dash/dot)
+    lines = text.strip().split('\n')
+    reference_line_count = 0
+    for line in lines:
+        if re.match(r"^\s*\d+[\.\)]", line.strip()):
+            reference_line_count += 1
+    
+    # If more than 50% of lines look like references
+    if reference_line_count > len(lines) * 0.5 and len(lines) > 2:
+        return True
+        
+    # Check for chunks that are mostly whitespace or very short
+    content_ratio = len(text.strip()) / max(len(text), 1)
+    if content_ratio < 0.3 or len(text.strip()) < 50:
+        return True
+        
+    return False
+
+def format_paper_info(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enhances the paper metadata with better formatting.
+    
+    Args:
+        metadata: The original metadata dictionary
+        
+    Returns:
+        Enhanced metadata with better paper presentation
+    """
+    source = metadata.get('source', 'Unknown source')
+    text = metadata.get('text', 'No text available')
+    arxiv_id = metadata.get('arxiv_id', '')
+    paper_url = metadata.get('paper_url', '')
+    
+    # If no arxiv_id was included in metadata, try to extract it from source
+    if not arxiv_id and source.endswith('.pdf'):
+        arxiv_id = os.path.splitext(source)[0].split('v')[0]  # Remove extension and version
+        paper_url = f"{ARXIV_BASE_URL}{arxiv_id}" if arxiv_id else ''
+    
+    # Create enhanced metadata
+    enhanced = {
+        **metadata,
+        "arxiv_id": arxiv_id,
+        "paper_url": paper_url,
+        "display_text": text
+    }
+    
+    return enhanced
+
 # --- FastAPI Endpoints ---
 
 @app.post("/process/{filename}")
@@ -648,11 +766,26 @@ def search_documents(request: SearchRequest):
         raise HTTPException(status_code=400, detail="Search query cannot be empty.")
 
     try:
-        logger.info(f"Embedding search query: '{request.query}'")
+        original_query = request.query
+        query_to_use = original_query
+        
+        # Apply query rewriting if requested and Claude client is available
+        if request.rewrite_query and CLAUDE_CLIENT and CLAUDE_CLIENT.client is not None:
+            try:
+                logger.info(f"Attempting to rewrite query: '{original_query}'")
+                rewritten_query = CLAUDE_CLIENT.rewrite_query(original_query)
+                if rewritten_query and rewritten_query != original_query:
+                    query_to_use = rewritten_query
+                    logger.info(f"Using rewritten query: '{query_to_use}'")
+            except Exception as e:
+                logger.error(f"Error during query rewriting: {e}. Using original query.")
+                query_to_use = original_query
+        
+        logger.info(f"Embedding search query: '{query_to_use}'")
 
         # Embed query using baseline model
         query_hidden_states = BASELINE_EMBED_FUNCTION(
-            BASELINE_MODEL, BASELINE_TOKENIZER, request.query, TARGET_EMBEDDING_LAYER
+            BASELINE_MODEL, BASELINE_TOKENIZER, query_to_use, TARGET_EMBEDDING_LAYER
         )
 
         # Convert query embedding to numpy float32 and average sequence dimension
@@ -677,22 +810,46 @@ def search_documents(request: SearchRequest):
         # Reshape for FAISS search (needs 2D array: [1, embedding_dim])
         query_emb_np_final = query_vector_avg.reshape(1, -1)
 
-        # Perform FAISS search
-        logger.info(f"Searching index with {FAISS_INDEX.ntotal} vectors for top {request.top_k} results.")
-        distances, indices = FAISS_INDEX.search(query_emb_np_final, request.top_k)
+        # Perform FAISS search with more results than needed to account for filtered results
+        extra_k = request.top_k * 2  # Get extra results to filter
+        logger.info(f"Searching index with {FAISS_INDEX.ntotal} vectors for top {extra_k} results (will filter down to {request.top_k}).")
+        distances, indices = FAISS_INDEX.search(query_emb_np_final, extra_k)
 
-        # Process results
+        # Process results with filtering for citations and noise
         results = []
+        filtered_count = 0
         if indices.size > 0:
             for i, idx in enumerate(indices[0]):
-                if idx != -1: # FAISS returns -1 for padding if fewer results than k are found
-                    results.append({
-                        "score": float(distances[0][i]), # For L2 index, distance is squared L2. Lower is better.
-                        "metadata": STORED_METADATA[idx]
-                    })
+                if idx != -1 and len(results) < request.top_k:  # FAISS returns -1 for padding if fewer results than k are found
+                    if 0 <= idx < len(STORED_METADATA):
+                        metadata = STORED_METADATA[idx]
+                        text = metadata.get("text", "")
+                        
+                        # Apply filtering if requested
+                        if request.filter_noise and is_citation_or_noise(text):
+                            filtered_count += 1
+                            continue  # Skip this result
+                            
+                        # Format paper information
+                        enhanced_metadata = format_paper_info(metadata)
+                        
+                        results.append({
+                            "score": float(distances[0][i]),  # For L2 index, distance is squared L2. Lower is better.
+                            "metadata": enhanced_metadata
+                        })
 
-        logger.info(f"Search completed. Found {len(results)} results for query: '{request.query}'")
-        return {"query": request.query, "results": results}
+        logger.info(f"Search completed. Found {len(results)} results for query: '{query_to_use}' (filtered {filtered_count} noisy results)")
+        response = {
+            "query": request.query, 
+            "results": results,
+            "filtered_count": filtered_count
+        }
+        
+        # Include rewritten query in response if applicable
+        if request.rewrite_query and query_to_use != original_query:
+            response["rewritten_query"] = query_to_use
+            
+        return response
 
     except Exception as e:
         logger.error(f"Error during search for query '{request.query}': {e}", exc_info=True)
@@ -716,9 +873,24 @@ def steered_search_documents(request: SteeredSearchRequest):
 
     # --- Get Base Activation ---
     try:
-        logger.info(f"Getting base activation for query: '{request.query}'")
+        original_query = request.query
+        query_to_use = original_query
+        
+        # Apply query rewriting if requested and Claude client is available
+        if request.rewrite_query and CLAUDE_CLIENT and CLAUDE_CLIENT.api_key:
+            try:
+                logger.info(f"Attempting to rewrite query: '{original_query}'")
+                rewritten_query = CLAUDE_CLIENT.rewrite_query(original_query)
+                if rewritten_query and rewritten_query != original_query:
+                    query_to_use = rewritten_query
+                    logger.info(f"Using rewritten query: '{query_to_use}'")
+            except Exception as e:
+                logger.error(f"Error during query rewriting: {e}. Using original query.")
+                query_to_use = original_query
+        
+        logger.info(f"Getting base activation for query: '{query_to_use}'")
         # Use the SAE model's method to get activation at the correct layer
-        base_activation_tensor = SAE_MODEL.get_activation(request.query)
+        base_activation_tensor = SAE_MODEL.get_activation(query_to_use)
         # Ensure it's on the correct device (matching SAE_MODEL.device)
         base_activation_tensor = base_activation_tensor.to(SAE_MODEL.device)
         logger.info(f"Base activation shape: {base_activation_tensor.shape}")
@@ -790,37 +962,185 @@ def steered_search_documents(request: SteeredSearchRequest):
              if query_emb_np.shape != (1, EMBEDDING_DIM):
                  raise ValueError(f"Unexpected final query embedding shape after potential pooling: {query_emb_np.shape}. Expected: (1, {EMBEDDING_DIM})")
 
-        # FAISS search
-        logger.info(f"Searching index with {FAISS_INDEX.ntotal} vectors for top {request.top_k} results.")
-        distances, indices = FAISS_INDEX.search(query_emb_np, request.top_k)
+        # Perform FAISS search with more results than needed to account for filtered results
+        extra_k = request.top_k * 2  # Get extra results to filter
+        logger.info(f"Searching index with {FAISS_INDEX.ntotal} vectors for top {extra_k} results (will filter down to {request.top_k}).")
+        distances, indices = FAISS_INDEX.search(query_emb_np, extra_k)
 
-        # Process results
+        # Process results with filtering
         results = []
+        filtered_count = 0
         if indices.size > 0:
             for i, idx in enumerate(indices[0]):
-                if idx != -1:
+                if idx != -1 and len(results) < request.top_k:
                     # Ensure metadata exists for the index
                     if 0 <= idx < len(STORED_METADATA):
+                        metadata = STORED_METADATA[idx]
+                        text = metadata.get("text", "")
+                        
+                        # Apply filtering if requested
+                        if request.filter_noise and is_citation_or_noise(text):
+                            filtered_count += 1
+                            continue  # Skip this result
+                            
+                        # Format paper information
+                        enhanced_metadata = format_paper_info(metadata)
+                        
                         results.append({
                             "score": float(distances[0][i]),
-                            "metadata": STORED_METADATA[idx]
+                            "metadata": enhanced_metadata
                         })
                     else:
                          logger.warning(f"FAISS index {idx} is out of bounds for STORED_METADATA (size {len(STORED_METADATA)}). Skipping result.")
 
-
         search_type = f"Steered ({len(applied_steering_info)} features)" if applied_steering_info else "Non-Steered"
-        logger.info(f"{search_type} search completed. Found {len(results)} results.")
+        logger.info(f"{search_type} search completed. Found {len(results)} results (filtered {filtered_count} noisy results).")
+        
         # Update response structure
-        return {
+        response = {
             "query": request.query,
             "steering_info": applied_steering_info, # Return list of applied features/strengths
-            "results": results
+            "results": results,
+            "filtered_count": filtered_count
         }
+        
+        # Include rewritten query in response if applicable
+        if request.rewrite_query and query_to_use != original_query:
+            response["rewritten_query"] = query_to_use
+            
+        return response
 
     except Exception as e:
         logger.error(f"Error during final embedding processing or FAISS search for query '{request.query}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to perform search: {str(e)}")
+
+# --- Auto-Steered Search Endpoint ---
+
+@app.post("/auto_steered_search")
+async def auto_steered_search(request: AutoSteeredSearchRequest):
+    logger.info(f"Received auto_steered_search request: {request.query}")
+
+    # Check if Claude client is available
+    if CLAUDE_CLIENT is None or CLAUDE_CLIENT.client is None:
+        logger.error("Claude API client not available or not initialized with API key.")
+        return JSONResponse(
+            status_code=503,
+            content={"message": "Auto-steering not available. Claude API client not initialized with API key."}
+        )
+    
+    if FAISS_INDEX.ntotal == 0:
+        logger.info("No documents processed yet. Cannot perform auto-steered search.")
+        return {"message": "No documents have been processed yet.", "results": []}
+    
+    if not request.query.strip():
+        logger.info("Received empty search query for auto-steered search.")
+        raise HTTPException(status_code=400, detail="Search query cannot be empty.")
+
+    try:
+        original_query = request.query
+        query_to_use = original_query
+        
+        # Apply query rewriting if requested
+        if request.rewrite_query:
+            try:
+                logger.info(f"Attempting to rewrite query: '{original_query}'")
+                rewritten_query = CLAUDE_CLIENT.rewrite_query(original_query)
+                if rewritten_query and rewritten_query != original_query:
+                    query_to_use = rewritten_query
+                    logger.info(f"Using rewritten query: '{query_to_use}'")
+            except Exception as e:
+                logger.error(f"Error during query rewriting: {e}. Using original query.")
+                query_to_use = original_query
+        
+        logger.info(f"Starting auto-steered search for query: '{query_to_use}'")
+        
+        # Step 1: Analyze query intent using Claude
+        query_intent = CLAUDE_CLIENT.analyze_query_intent(query_to_use)
+        if not query_intent:
+            logger.warning(f"Failed to analyze query intent for '{query_to_use}'. Falling back to standard search.")
+            # Fall back to standard search
+            return search_documents(SearchRequest(query=query_to_use, top_k=request.top_k, filter_noise=request.filter_noise, rewrite_query=False))
+        
+        # Step 2: Get candidate features
+        top_features = SAE_MODEL.get_top_features(query_to_use, k=MAX_FEATURES_TO_MATCH)
+        if not top_features:
+            logger.warning(f"No candidate features found for query '{query_to_use}'. Falling back to standard search.")
+            # Fall back to standard search
+            return search_documents(SearchRequest(query=query_to_use, top_k=request.top_k, filter_noise=request.filter_noise, rewrite_query=False))
+        
+        # Format features for Claude API
+        features_for_matching = []
+        for feature in top_features:
+            feature_id = feature["feature_id"]
+            activation = feature["activation"]
+            explanations = feature["explanations"]
+            description = explanations[0] if explanations else "No explanation available."
+            
+            features_for_matching.append({
+                "feature_id": feature_id,
+                "description": description,
+                "activation": activation
+            })
+        
+        # Step 3: Match features to query intent
+        selected_features = CLAUDE_CLIENT.match_features_to_intent(
+            features_for_matching, 
+            query_intent
+        )
+        
+        if not selected_features:
+            logger.warning(f"No features selected for query '{query_to_use}'. Falling back to standard search.")
+            # Fall back to standard search
+            return search_documents(SearchRequest(query=query_to_use, top_k=request.top_k, filter_noise=request.filter_noise, rewrite_query=False))
+        
+        # Limit to requested number of features
+        if len(selected_features) > request.max_features:
+            selected_features = selected_features[:request.max_features]
+        
+        # Step 4: Convert to steering parameters
+        steering_params = []
+        for feature in selected_features:
+            # Cap strength to max_strength
+            raw_strength = float(feature.get("strength", 0))
+            capped_strength = max(min(raw_strength, 10), -10)
+            scaled_strength = (capped_strength / 10) * request.max_strength
+            
+            steering_params.append(SteeringParam(
+                feature_id=int(feature["feature_id"]),
+                strength=scaled_strength
+            ))
+        
+        logger.info(f"Auto-selected {len(steering_params)} steering features for query '{request.query}'")
+        
+        # Step 5: Create steered search request with selected parameters
+        steered_request = SteeredSearchRequest(
+            query=query_to_use,
+            top_k=request.top_k,
+            steering_params=steering_params,
+            filter_noise=request.filter_noise,
+            rewrite_query=False  # Already rewritten if needed
+        )
+        
+        # Step 6: Execute steered search with selected parameters
+        search_results = steered_search_documents(steered_request)
+        
+        # Add auto-steering info to the response
+        search_results["auto_steering"] = {
+            "query_intent": query_intent,
+            "selected_features": selected_features
+        }
+        
+        # Include the original query and rewritten query if different
+        if request.rewrite_query and query_to_use != original_query:
+            if "rewritten_query" not in search_results:  # avoid duplication if steered_search already added it
+                search_results["rewritten_query"] = query_to_use
+            search_results["original_query"] = original_query
+        
+        return search_results
+        
+    except Exception as e:
+        logger.error(f"Error during auto-steered search for query '{request.query}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to perform auto-steered search: {str(e)}")
 
 # --- New Endpoint to Get Available Features ---
 @app.get("/features")
