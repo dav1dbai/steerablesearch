@@ -161,7 +161,7 @@ class ClaudeAPIClient:
 
             # With the new anthropic client logic:
             message = self.client.messages.create(
-                model="claude-3-7-sonnet-20250219", # Use the latest Sonnet model
+                model="claude-3-5-sonnet-20241022", # Use the latest Sonnet model
                 max_tokens=1024, # Keep max_tokens, or adjust as needed
                 messages=[
                     {"role": "user", "content": prompt}

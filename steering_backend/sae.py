@@ -306,7 +306,7 @@ class SAEModel:
         steering_feature: int,
         steering_strength: float = 1.0,
     ):
-        """Gets the activation vector with steering applied for the last token."""
+        """Gets the activation vector with steering applied for the last token (single feature)."""
         if not prompt:
             logging.warning("Received empty prompt for get_steered_activation.")
             d_model = self.sae.cfg.d_in
@@ -352,6 +352,120 @@ class SAEModel:
 
         except Exception as e:
             logging.error(f"Error during get_steered_activation for feature {steering_feature}, prompt '{prompt}': {e}")
+            logging.error(traceback.format_exc())
+            d_model = self.sae.cfg.d_in
+            return torch.zeros((1, d_model), device=self.device)
+            
+    def get_multi_steered_activation(
+        self,
+        prompt: str, 
+        steering_params: list
+    ):
+        """
+        Gets the activation with multiple steering vectors applied during the forward pass.
+        Each parameter should be a dict with 'feature_id' and 'strength' keys.
+        
+        This properly applies steering during the model forward pass rather than adding 
+        vectors to the embedding after the fact.
+        """
+        if not prompt:
+            logging.warning("Received empty prompt for get_multi_steered_activation.")
+            d_model = self.sae.cfg.d_in
+            return torch.zeros((1, d_model), device=self.device)
+            
+        if not steering_params:
+            logging.info("No steering parameters provided. Returning regular activation.")
+            return self.get_activation(prompt)
+            
+        logging.info(f"Getting multi-steered activation with {len(steering_params)} features for prompt: '{prompt}'")
+        
+        # Prepare the combined steering hook
+        try:
+            # Gather all steering vectors and their strengths
+            steering_vectors = []
+            for param in steering_params:
+                # Handle different parameter formats (dict or object)
+                if isinstance(param, dict):
+                    feature_id = param.get('feature_id')
+                    strength = param.get('strength', 0.0)
+                else:
+                    # Try to access as object attributes
+                    try:
+                        feature_id = getattr(param, 'feature_id', None)
+                        strength = getattr(param, 'strength', 0.0)
+                    except (AttributeError, TypeError):
+                        logging.warning(f"Invalid steering parameter format: {param}")
+                        continue
+                
+                if feature_id is None:
+                    logging.warning("Skipping steering parameter with missing feature_id")
+                    continue
+                    
+                if not isinstance(feature_id, int) or feature_id < 0 or feature_id >= self.sae.W_dec.shape[0]:
+                    logging.warning(f"Feature ID {feature_id} is out of bounds. Skipping.")
+                    continue
+                    
+                # Get max activation for proper scaling
+                max_act = self.get_feature_max_activation(feature_id)
+                if max_act is None or max_act == 0:
+                    max_act = 1.0  # Fallback default
+                    logging.warning(f"Using default max_act=1.0 for feature {feature_id}")
+                
+                # Get the steering vector
+                steering_vec = self.sae.W_dec[feature_id].to(self.device)
+                
+                steering_vectors.append({
+                    'vector': steering_vec,
+                    'strength': strength,
+                    'max_act': max_act
+                })
+            
+            if not steering_vectors:
+                logging.warning("No valid steering vectors found. Returning regular activation.")
+                return self.get_activation(prompt)
+                
+            # Define a multi-steering hook function
+            def multi_steering_hook_fn(activations, hook):
+                # Apply each steering vector in sequence
+                for steering_info in steering_vectors:
+                    vec = steering_info['vector']
+                    strength = steering_info['strength']
+                    max_act = steering_info['max_act']
+                    
+                    # Ensure tensor is on the correct device and dtype
+                    vec = vec.to(activations.device, dtype=activations.dtype)
+                    
+                    # Apply steering
+                    activations = activations + max_act * strength * vec
+                    
+                return activations
+            
+            # Run model with the multi-steering hook
+            # This is the key part that applies steering DURING the model forward pass
+            # rather than post-hoc modification of the embedding
+            with self.model.hooks(fwd_hooks=[(self.sae.cfg.hook_name, multi_steering_hook_fn)]):
+                _, cache = self.model.run_with_cache(
+                    prompt,
+                    names_filter=[self.sae.cfg.hook_name],
+                    stop_at_layer=self.sae.cfg.hook_layer + 1
+                )
+            
+            # Get the steered activations from cache
+            hook_name = self.sae.cfg.hook_name
+            if hook_name not in cache:
+                logging.error(f"Hook point '{hook_name}' not found in cache during get_multi_steered_activation.")
+                d_model = self.sae.cfg.d_in
+                return torch.zeros((1, d_model), device=self.device)
+                
+            # Extract the activations for the last token
+            activations = cache[hook_name]
+            last_token_activation = activations[:, -1, :]
+            
+            logging.info(f"Successfully retrieved multi-steered activation (shape: {last_token_activation.shape})")
+            return last_token_activation
+            
+        except Exception as e:
+            logging.error(f"Error during get_multi_steered_activation: {e}")
             logging.error(traceback.format_exc())
             d_model = self.sae.cfg.d_in
             return torch.zeros((1, d_model), device=self.device)

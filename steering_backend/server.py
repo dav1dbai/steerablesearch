@@ -868,7 +868,7 @@ def format_paper_info(metadata: Dict[str, Any]) -> Dict[str, Any]:
         # Try with/without dots
         if '.' in arxiv_id:
             variations.append(arxiv_id.replace('.', ''))
-        elif len(arxiv_id) >= 9:  # Looks like YYMMNNNNN format
+        elif len(arxiv_id) >= 9:  # Looks like it might be YYMMNNNNN format
             # Try to insert a dot after the first 4 characters
             dotted_id = f"{arxiv_id[:4]}.{arxiv_id[4:]}"
             variations.append(dotted_id)
@@ -1126,10 +1126,10 @@ async def steered_search_documents(request: SteeredSearchRequest):
         logger.info("Received empty search query for steered search.")
         raise HTTPException(status_code=400, detail="Search query cannot be empty.")
 
-    # --- Get Base Activation ---
     try:
         original_query = request.query
         query_to_use = original_query
+        applied_steering_info = [] # Store details of features successfully applied
         
         # Apply query rewriting if requested and Claude client is available
         if request.rewrite_query and CLAUDE_CLIENT and CLAUDE_CLIENT.client is not None:
@@ -1142,80 +1142,80 @@ async def steered_search_documents(request: SteeredSearchRequest):
             except Exception as e:
                 logger.error(f"Error during query rewriting: {e}. Using original query.")
                 query_to_use = original_query
+
+        # Process steering parameters if available
+        if request.steering_params:
+            logger.info(f"Processing {len(request.steering_params)} steering parameters...")
+            valid_feature_ids = set(SAE_MODEL.explanations_df['feature'].unique()) if SAE_MODEL.explanations_df is not None else set()
+            
+            # Prepare steering parameters in the format needed for get_multi_steered_activation
+            steering_params_for_hook = []
+            
+            for param in request.steering_params:
+                feature_id = param.feature_id
+                strength = param.strength
+
+                if feature_id not in valid_feature_ids:
+                    logger.warning(f"Requested steering feature {feature_id} not found or explanations not loaded. Skipping.")
+                    continue
+
+                try:
+                    # Get max activation for scaling for tracking/logging
+                    max_act = SAE_MODEL.get_feature_max_activation(feature_id)
+                    if max_act is None or max_act == 0: 
+                        logger.warning(f"Max activation for feature {feature_id} is invalid ({max_act}). Using default value.")
+                        max_act = 1.0  # Use a default for logging, actual max_act will be handled in the hook
+
+                    # Add to parameters for the hook - ensure we use dict format for hook
+                    steering_params_for_hook.append({
+                        'feature_id': feature_id,
+                        'strength': strength
+                    })
+
+                    # Log applied feature details
+                    explanation_rows = SAE_MODEL.explanations_df[SAE_MODEL.explanations_df['feature'] == feature_id]
+                    explanation = explanation_rows['description'].iloc[0] if not explanation_rows.empty else "Explanation not found."
+                    applied_steering_info.append({
+                        "feature_id": feature_id,
+                        "strength": strength,
+                        "max_activation_used": max_act,
+                        "explanation": explanation
+                    })
+                    logger.info(f"Adding steering for feature {feature_id} with strength {strength:.2f}")
+
+                except Exception as e:
+                    logger.error(f"Error processing steering parameter for feature {feature_id}: {e}", exc_info=True)
+            
+            # Apply steering vectors DURING the model forward pass by using hooks
+            # This is significantly different from the previous approach which calculated
+            # embeddings first and then added steering vectors as a post-processing step
+            if steering_params_for_hook:
+                logger.info(f"Getting multi-steered activation with {len(steering_params_for_hook)} features")
+                # This call runs the query through a model with hooks that apply steering at the right layer
+                query_embedding_tensor = SAE_MODEL.get_multi_steered_activation(query_to_use, steering_params_for_hook)
+                logger.info(f"Successfully retrieved steered embedding with shape {query_embedding_tensor.shape}")
+            else:
+                # If no valid steering parameters, just get the regular activation
+                logger.info("No valid steering parameters found. Getting regular activation.")
+                query_embedding_tensor = SAE_MODEL.get_activation(query_to_use)
+        else:
+            # No steering requested, get regular activation
+            logger.info("No steering parameters provided. Getting regular activation.")
+            query_embedding_tensor = SAE_MODEL.get_activation(query_to_use)
         
-        logger.info(f"Getting base activation for query: '{query_to_use}'")
-        # Use the SAE model's method to get activation at the correct layer
-        base_activation_tensor = SAE_MODEL.get_activation(query_to_use)
-        # Ensure it's on the correct device (matching SAE_MODEL.device)
-        base_activation_tensor = base_activation_tensor.to(SAE_MODEL.device)
-        logger.info(f"Base activation shape: {base_activation_tensor.shape}")
+        # Ensure it's on the correct device
+        query_embedding_tensor = query_embedding_tensor.to(SAE_MODEL.device)
+        logger.info(f"Final query embedding shape: {query_embedding_tensor.shape}")
 
-    except Exception as e:
-        logger.error(f"Error getting base activation for query '{request.query}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to get base activation: {str(e)}")
-
-
-    # --- Calculate Combined Steering Offset ---
-    total_steering_offset = torch.zeros_like(base_activation_tensor) # Initialize offset tensor on the same device
-    applied_steering_info = [] # Store details of features successfully applied
-
-    if request.steering_params:
-        logger.info(f"Processing {len(request.steering_params)} steering parameters...")
-        valid_feature_ids = set(SAE_MODEL.explanations_df['feature'].unique()) if SAE_MODEL.explanations_df is not None else set()
-
-        for param in request.steering_params:
-            feature_id = param.feature_id
-            strength = param.strength
-
-            if feature_id not in valid_feature_ids:
-                logger.warning(f"Requested steering feature {feature_id} not found or explanations not loaded. Skipping.")
-                continue
-
-            try:
-                # Get max activation for scaling
-                max_act = SAE_MODEL.get_feature_max_activation(feature_id)
-                if max_act is None or max_act == 0: # Handle cases where max_act is invalid
-                     logger.warning(f"Max activation for feature {feature_id} is invalid ({max_act}). Skipping feature.")
-                     continue
-
-                # Get the steering vector (decoder weight)
-                steering_vector = SAE_MODEL.sae.W_dec[feature_id]
-                steering_vector = steering_vector.to(total_steering_offset.device, dtype=total_steering_offset.dtype)
-
-                # Calculate offset for this feature
-                offset = strength * max_act * steering_vector
-                total_steering_offset += offset
-
-                # Log applied feature details
-                explanation_rows = SAE_MODEL.explanations_df[SAE_MODEL.explanations_df['feature'] == feature_id]
-                explanation = explanation_rows['description'].iloc[0] if not explanation_rows.empty else "Explanation not found."
-                applied_steering_info.append({
-                    "feature_id": feature_id,
-                    "strength": strength,
-                    "max_activation_used": max_act, # Include max_act used for scaling
-                    "explanation": explanation
-                })
-                logger.info(f"Applied steering for feature {feature_id} with strength {strength:.2f} (max_act={max_act:.4f})")
-
-            except Exception as e:
-                logger.error(f"Error processing steering for feature {feature_id}: {e}", exc_info=True)
-                # Decide whether to continue or raise an error for the whole request
-
-    # --- Apply Offset and Perform Search ---
-    try:
-        # Add the combined offset to the base activation
-        final_query_emb_tensor = base_activation_tensor + total_steering_offset
-        logger.info(f"Final query embedding shape after steering: {final_query_emb_tensor.shape}")
-
-        # Convert final tensor to numpy for FAISS
+        # Convert tensor to numpy for FAISS
         # Ensure shape is (1, EMBEDDING_DIM)
-        query_emb_np = final_query_emb_tensor.detach().numpy().astype('float32')
+        query_emb_np = query_embedding_tensor.detach().numpy().astype('float32')
         if query_emb_np.shape != (1, EMBEDDING_DIM):
              # Add potential reshaping logic if needed (e.g., if pooling was missed in get_activation)
              if len(query_emb_np.shape) == 3 and query_emb_np.shape[0] == 1:
                  query_emb_np = np.mean(query_emb_np[0, :, :], axis=0).reshape(1, -1)
              if query_emb_np.shape != (1, EMBEDDING_DIM):
-                 raise ValueError(f"Unexpected final query embedding shape after potential pooling: {query_emb_np.shape}. Expected: (1, {EMBEDDING_DIM})")
+                 raise ValueError(f"Unexpected query embedding shape: {query_emb_np.shape}. Expected: (1, {EMBEDDING_DIM})")
 
         # Perform FAISS search with more results than needed to account for filtered results
         extra_k = request.top_k * 2  # Get extra results to filter
@@ -1277,7 +1277,7 @@ async def steered_search_documents(request: SteeredSearchRequest):
                         "metadata": enhanced_metadata
                     })
         else:
-            logger.warning(f"FAISS index {idx} is out of bounds for STORED_METADATA (size {len(STORED_METADATA)}). Skipping result.")
+            logger.warning(f"No valid indices returned from FAISS search. STORED_METADATA size: {len(STORED_METADATA)}")
 
         search_type = f"Steered ({len(applied_steering_info)} features)" if applied_steering_info else "Non-Steered"
         logger.info(f"{search_type} search completed. Found {len(results)} results (filtered {filtered_count} noisy results).")
@@ -1354,46 +1354,57 @@ async def auto_steered_search(request: AutoSteeredSearchRequest):
             # Fall back to standard search
             return search_documents(SearchRequest(query=query_to_use, top_k=request.top_k, filter_noise=request.filter_noise, rewrite_query=False))
         
-        # Format features for Claude API
-        features_for_matching = []
-        for feature in top_features:
-            feature_id = feature["feature_id"]
-            activation = feature["activation"]
-            explanations = feature["explanations"]
-            description = explanations[0] if explanations else "No explanation available."
-            
-            features_for_matching.append({
-                "feature_id": feature_id,
-                "description": description,
-                "activation": activation
-            })
+        logger.info(f"Found {len(top_features)} top activating features. Getting explanations...")
+
+        # Prepare features with explanations for Claude
+        top_features_with_explanations = []
+        if top_features:
+            for feature_info in top_features:
+                feature_id = feature_info.get('feature_id')
+                activation = feature_info.get('activation')
+                explanations = feature_info.get('explanations', ['No explanation found.'])
+                
+                # Only include features with valid ID and activation
+                if feature_id is not None and activation is not None:
+                    top_features_with_explanations.append({
+                        "feature_id": feature_id,
+                        "activation": activation,
+                        "description": "; ".join(explanations) # Combine multiple explanations if needed
+                    })
         
-        # Step 3: Match features to query intent
-        selected_features = CLAUDE_CLIENT.match_features_to_intent(
-            features_for_matching, 
-            query_intent
-        )
+        # --- DEBUG PRINT 1: Query Intent ---
+        print(f"DEBUG: Query Intent for Feature Matching:\n{json.dumps(query_intent, indent=2)}")
         
-        if not selected_features:
-            logger.warning(f"No features selected for query '{query_to_use}'. Falling back to standard search.")
-            # Fall back to standard search
-            return search_documents(SearchRequest(query=query_to_use, top_k=request.top_k, filter_noise=request.filter_noise, rewrite_query=False))
-        
-        # Limit to requested number of features
-        if len(selected_features) > request.max_features:
-            selected_features = selected_features[:request.max_features]
+        # --- DEBUG PRINT 2: Candidate Features ---
+        print(f"DEBUG: Candidate Features Sent to Claude ({len(top_features_with_explanations)}):\n{json.dumps(top_features_with_explanations, indent=2)}")
+
+        # 3. Claude Selects Features Based on Intent
+        logger.info("Requesting Claude to select features based on intent...")
+        selected_features = []
+        if CLAUDE_CLIENT and CLAUDE_CLIENT.client and top_features_with_explanations:
+             try:
+                selected_features = CLAUDE_CLIENT.match_features_to_intent(
+                    features=top_features_with_explanations,
+                    query_intent=query_intent
+                )
+                # --- DEBUG PRINT 3: Selected Features ---
+                print(f"DEBUG: Features Selected by Claude ({len(selected_features)}):\n{json.dumps(selected_features, indent=2)}")
+                
+                # Apply constraints from request
+                selected_features = selected_features[:request.max_features] # Limit number
+                for feature in selected_features:
+                    feature['strength'] = max(min(feature['strength'], request.max_strength), -request.max_strength) # Clamp strength
+                
+             except Exception as e:
+                logger.error(f"Error during feature selection: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Failed to select features: {str(e)}")
         
         # Step 4: Convert to steering parameters
         steering_params = []
         for feature in selected_features:
-            # Cap strength to max_strength
-            raw_strength = float(feature.get("strength", 0))
-            capped_strength = max(min(raw_strength, 10), -10)
-            scaled_strength = (capped_strength / 10) * request.max_strength
-            
             steering_params.append(SteeringParam(
                 feature_id=int(feature["feature_id"]),
-                strength=scaled_strength
+                strength=float(feature["strength"])
             ))
         
         logger.info(f"Auto-selected {len(steering_params)} steering features for query '{request.query}'")
@@ -1407,7 +1418,7 @@ async def auto_steered_search(request: AutoSteeredSearchRequest):
             rewrite_query=False  # Already rewritten if needed
         )
         
-        # Step 6: Execute steered search with selected parameters
+        # Step 6: Execute steered search with selected parameters (now uses proper in-model steering)
         search_results = await steered_search_documents(steered_request)
         
         # Add auto-steering info to the response
