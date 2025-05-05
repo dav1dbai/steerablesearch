@@ -43,6 +43,7 @@ ARXIV_DIR = os.path.join(_SCRIPT_DIR, "arxiv")
 FAISS_DATA_DIR = os.path.join(_SCRIPT_DIR, "faiss_data") # New directory for index/metadata
 FAISS_INDEX_PATH = os.path.join(FAISS_DATA_DIR, "arxiv_index.faiss") # Updated path
 METADATA_PATH = FAISS_INDEX_PATH + ".meta.json" # Updated path
+ARXIV_METADATA_PATH = os.path.join(ARXIV_DIR, "arxiv_metadata.json") # Paper metadata with titles
 # TARGET_EMBEDDING_LAYER = 20  # Example layer, adjust as needed
 # TARGET_EMBEDDING_LAYER = None # This will be set based on SAE layer
 CHUNK_SIZE = 500  # Preferred characters per chunk
@@ -69,6 +70,7 @@ BASELINE_EMBED_FUNCTION = None
 
 FAISS_INDEX = None     # faiss.Index
 STORED_METADATA = []   # List[dict] - [{"source": str, "text": str, "chunk_index": int, "faiss_index": int}]
+PAPER_METADATA = {}    # Dict[str, Dict] - {"arxiv_id": {"title": str, "authors": str, ...}}
 
 
 # --- Pydantic Models ---
@@ -97,7 +99,85 @@ class AutoSteeredSearchRequest(SearchRequest):
 # --- FastAPI Application Instance ---
 app = FastAPI(title="Steering Search Backend", version="0.1.0")
 
+# Import CORS middleware
+try:
+    from middleware import add_cors_middleware
+    app = add_cors_middleware(app)
+except ImportError:
+    # Handle case when middleware module is not found
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Allow all origins for easier development
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    logger.info("Using default CORS settings")
+
 # --- Startup and Shutdown Logic ---
+
+def _load_paper_metadata():
+    """Load paper metadata from JSON file if available."""
+    global PAPER_METADATA
+    if os.path.exists(ARXIV_METADATA_PATH):
+        try:
+            with open(ARXIV_METADATA_PATH, 'r') as f:
+                raw_metadata = json.load(f)
+            
+            # Copy raw metadata to global variable
+            PAPER_METADATA = {}
+            
+            # Process and normalize IDs for better matching
+            for paper_id, metadata in raw_metadata.items():
+                # Keep the original entry
+                PAPER_METADATA[paper_id] = metadata
+                
+                # Add entries with and without version suffixes for better matching
+                if 'v' in paper_id and paper_id.split('v')[0] != paper_id:
+                    base_id = paper_id.split('v')[0]
+                    if base_id not in PAPER_METADATA:
+                        PAPER_METADATA[base_id] = metadata.copy()
+                        logger.info(f"Added base ID entry: {base_id} from {paper_id}")
+                
+                # Add entries with and without dots for better matching
+                if '.' in paper_id:
+                    no_dot_id = paper_id.replace('.', '')
+                    if no_dot_id not in PAPER_METADATA:
+                        PAPER_METADATA[no_dot_id] = metadata.copy()
+                        logger.info(f"Added no-dot ID entry: {no_dot_id} from {paper_id}")
+            
+            # Verify the loaded data
+            title_count = sum(1 for paper_id, metadata in PAPER_METADATA.items() 
+                             if metadata.get('title') and len(metadata.get('title', '')) > 3)
+            
+            logger.info(f"Loaded metadata for {len(raw_metadata)} papers, expanded to {len(PAPER_METADATA)} entries ({title_count} with valid titles).")
+            
+            # Sample some entries to verify
+            for i, (paper_id, metadata) in enumerate(list(PAPER_METADATA.items())[:10]):
+                title = metadata.get('title', 'No title')
+                if len(title) > 50:
+                    title = title[:50] + "..."
+                logger.info(f"Sample paper {i+1}: ID={paper_id}, Title={title}")
+            
+            # Simulates a search to check what would happen
+            test_ids = ["2504.14879", "2504.14879v1", "250414879", "250414879v1"]
+            logger.info("Testing ID lookup for common formats:")
+            for test_id in test_ids:
+                if test_id in PAPER_METADATA:
+                    logger.info(f"✓ Found metadata for {test_id}: {PAPER_METADATA[test_id].get('title', '')[:30]}...")
+                else:
+                    logger.warning(f"✗ No metadata found for {test_id}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error loading paper metadata: {e}", exc_info=True)
+            PAPER_METADATA = {}
+            return False
+    else:
+        logger.warning(f"Paper metadata file not found at {ARXIV_METADATA_PATH}. No paper titles will be available.")
+        PAPER_METADATA = {}
+        return False
 
 def _load_sae_model():
     """Loads the SAE model and determines embedding dimension."""
@@ -226,6 +306,9 @@ def startup_event():
     if not _load_or_initialize_index_and_metadata():
         # This function currently always returns True, but for future-proofing:
         raise RuntimeError("Failed to load or initialize FAISS index/metadata. Server cannot start.")
+        
+    # Load paper metadata (titles, authors, etc.)
+    _load_paper_metadata()  # Non-critical, don't raise exception if fails
 
     logger.info("--- Server Startup Sequence Complete ---")
 
@@ -385,7 +468,60 @@ def _embed_chunks(text_chunks: list[str], filename: str) -> tuple[list[np.ndarra
     logger.info(f"Embedding {len(text_chunks)} chunks for {filename} using baseline model at layer {TARGET_EMBEDDING_LAYER}...")
 
     # Extract arXiv ID from filename
-    arxiv_id = os.path.splitext(filename)[0].split('v')[0]  # Remove extension and version
+    filename_base = os.path.splitext(filename)[0]  # Remove extension
+    
+    # Try to preserve version info but still get the base ID
+    match = re.match(r'^(.*?)(v\d+)?$', filename_base)
+    if match:
+        base_arxiv_id = match.group(1)
+        version = match.group(2) or ''
+    else:
+        base_arxiv_id = filename_base
+        version = ''
+        
+    # Full ID with version (if any)
+    arxiv_id = base_arxiv_id + version
+    
+    # Try to get paper title from metadata - be very explicit in logging
+    logger.info(f"Looking for title for paper: filename={filename}, base_id={base_arxiv_id}, full_id={arxiv_id}")
+    
+    # Initialize paper title
+    paper_title = ""
+    
+    # Try different ID variations
+    variations = [
+        arxiv_id,  # Full ID with version
+        base_arxiv_id,  # Base ID without version
+    ]
+    
+    # Add variations with/without dots
+    if '.' in base_arxiv_id:
+        variations.append(base_arxiv_id.replace('.', ''))  # No dots
+        variations.append(arxiv_id.replace('.', ''))  # No dots with version
+    elif len(base_arxiv_id) >= 8:  # Looks like it might be YYMMNNNNN format
+        # Try adding a dot after first 4 chars
+        dotted_base = f"{base_arxiv_id[:4]}.{base_arxiv_id[4:]}"
+        dotted_full = dotted_base + version
+        variations.append(dotted_base)
+        variations.append(dotted_full)
+    
+    # Try each variation
+    for var_id in variations:
+        if var_id in PAPER_METADATA:
+            title = PAPER_METADATA[var_id].get('title', '')
+            if title and len(title) > 5:
+                paper_title = title
+                logger.info(f"✓ SUCCESS! Found title using ID {var_id}: '{paper_title}'")
+                break
+            else:
+                logger.warning(f"Found metadata entry for {var_id} but title is invalid: '{title}'")
+    
+    # Log if no title found
+    if not paper_title:
+        logger.warning(f"❌ No title found for any variation of {arxiv_id}. Tried: {variations}")
+        # Dump a few metadata keys to help debug
+        sample_keys = list(PAPER_METADATA.keys())[:5]
+        logger.info(f"First few metadata keys: {sample_keys}")
 
     for i, chunk in enumerate(text_chunks):
         if not chunk.strip():
@@ -416,13 +552,14 @@ def _embed_chunks(text_chunks: list[str], filename: str) -> tuple[list[np.ndarra
                  continue
 
             embeddings_list.append(avg_embedding)
-            # Enhanced metadata with arXiv ID and paper URL
+            # Enhanced metadata with arXiv ID, paper URL, and title
             chunk_metadata_list.append({
                 "source": filename,
                 "text": chunk,
                 "chunk_index": i,
                 "arxiv_id": arxiv_id,
-                "paper_url": f"{ARXIV_BASE_URL}{arxiv_id}"
+                "paper_url": f"{ARXIV_BASE_URL}{arxiv_id}",
+                "paper_title": paper_title
              })
 
         except Exception as e:
@@ -620,7 +757,8 @@ def index_all_arxiv_pdfs():
 
 def is_citation_or_noise(text: str) -> bool:
     """
-    Determines if a text chunk is primarily citations or noise.
+    Legacy function for determining if a text chunk is primarily citations or noise.
+    Kept for backward compatibility but not used in the main search flow.
     
     Returns:
         bool: True if the chunk contains primarily citations or noise, False otherwise
@@ -661,6 +799,40 @@ def is_citation_or_noise(text: str) -> bool:
         
     return False
 
+async def filter_content_async(text: str, client=None) -> dict:
+    """
+    Asynchronous wrapper around CLAUDE_CLIENT.filter_content.
+    This allows for parallel content filtering.
+    
+    Args:
+        text: The text to analyze for filtering
+        client: Optional Claude client (uses global client if None)
+        
+    Returns:
+        Dict with 'should_filter' and 'reason' keys
+    """
+    global CLAUDE_CLIENT
+    if client is None:
+        client = CLAUDE_CLIENT
+        
+    # Quick rule-based checks to avoid unnecessary API calls
+    # Very short content is automatically filtered
+    if len(text.strip()) < 50:
+        return {"should_filter": True, "reason": "Content too short"}
+        
+    try:
+        if client and client.client is not None:
+            return client.filter_content(text)
+        else:
+            # Fallback to the simple rule-based approach if Claude is unavailable
+            should_filter = is_citation_or_noise(text)
+            reason = "Rule-based filtering" if should_filter else "Passed rule-based check"
+            return {"should_filter": should_filter, "reason": reason}
+    except Exception as e:
+        logger.error(f"Error in parallel filtering: {e}")
+        # Return a safe default if something goes wrong
+        return {"should_filter": False, "reason": f"Error during filtering: {str(e)}"}
+
 def format_paper_info(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     Enhances the paper metadata with better formatting.
@@ -675,17 +847,68 @@ def format_paper_info(metadata: Dict[str, Any]) -> Dict[str, Any]:
     text = metadata.get('text', 'No text available')
     arxiv_id = metadata.get('arxiv_id', '')
     paper_url = metadata.get('paper_url', '')
+    paper_title = metadata.get('paper_title', '')
     
     # If no arxiv_id was included in metadata, try to extract it from source
     if not arxiv_id and source.endswith('.pdf'):
         arxiv_id = os.path.splitext(source)[0].split('v')[0]  # Remove extension and version
         paper_url = f"{ARXIV_BASE_URL}{arxiv_id}" if arxiv_id else ''
     
+    # Log the original metadata title if it exists
+    if paper_title:
+        logger.info(f"Paper {arxiv_id} already has title in chunk metadata: {paper_title}")
+    
+    # Try all different variations of ArXiv IDs to maximize chances of finding metadata
+    variations = []
+    if arxiv_id:
+        # Add base ID (without version)
+        base_id = re.sub(r'v\d+$', '', arxiv_id)
+        variations.append(base_id)
+        
+        # Try with/without dots
+        if '.' in arxiv_id:
+            variations.append(arxiv_id.replace('.', ''))
+        elif len(arxiv_id) >= 9:  # Looks like YYMMNNNNN format
+            # Try to insert a dot after the first 4 characters
+            dotted_id = f"{arxiv_id[:4]}.{arxiv_id[4:]}"
+            variations.append(dotted_id)
+        
+        # Try with explicit version suffixes
+        for v in range(1, 3):  # Try v1, v2
+            variations.append(f"{base_id}v{v}")
+    
+    # Log what we're trying
+    logger.info(f"Looking for metadata with ID variations: {arxiv_id}, {variations}")
+    
+    # First try the exact ID
+    if not paper_title and arxiv_id in PAPER_METADATA:
+        paper_title = PAPER_METADATA[arxiv_id].get('title', '')
+        if paper_title:
+            logger.info(f"✓ Found title for exact ID {arxiv_id}: {paper_title}")
+    
+    # If still no title, try variations
+    if not paper_title:
+        for var_id in variations:
+            if var_id in PAPER_METADATA:
+                paper_title = PAPER_METADATA[var_id].get('title', '')
+                if paper_title:
+                    logger.info(f"✓ Found title using variation {var_id}: {paper_title}")
+                    break
+    
+    # If still no title, log warning
+    if not paper_title:
+        logger.warning(f"❌ No title found for any variant of {arxiv_id}")
+        
+        # Dump the first few characters of metadata keys to help debug
+        sample_keys = str(list(PAPER_METADATA.keys())[:5])
+        logger.info(f"Sample metadata keys: {sample_keys}")
+    
     # Create enhanced metadata
     enhanced = {
         **metadata,
         "arxiv_id": arxiv_id,
         "paper_url": paper_url,
+        "paper_title": paper_title,
         "display_text": text
     }
     
@@ -752,7 +975,7 @@ def read_root():
 
 # New endpoint for searching
 @app.post("/search")
-def search_documents(request: SearchRequest):
+async def search_documents(request: SearchRequest):
     global FAISS_INDEX, STORED_METADATA
 
     if BASELINE_MODEL is None or FAISS_INDEX is None:
@@ -815,28 +1038,60 @@ def search_documents(request: SearchRequest):
         logger.info(f"Searching index with {FAISS_INDEX.ntotal} vectors for top {extra_k} results (will filter down to {request.top_k}).")
         distances, indices = FAISS_INDEX.search(query_emb_np_final, extra_k)
 
-        # Process results with filtering for citations and noise
+        # Process results with parallel filtering for citations and noise
         results = []
         filtered_count = 0
+        filtering_tasks = []
+        candidate_results = []
+        
         if indices.size > 0:
+            # First collect all candidate results and create filtering tasks
             for i, idx in enumerate(indices[0]):
-                if idx != -1 and len(results) < request.top_k:  # FAISS returns -1 for padding if fewer results than k are found
+                if idx != -1:  # FAISS returns -1 for padding if fewer results than k are found
                     if 0 <= idx < len(STORED_METADATA):
                         metadata = STORED_METADATA[idx]
                         text = metadata.get("text", "")
                         
-                        # Apply filtering if requested
-                        if request.filter_noise and is_citation_or_noise(text):
-                            filtered_count += 1
-                            continue  # Skip this result
-                            
-                        # Format paper information
-                        enhanced_metadata = format_paper_info(metadata)
+                        # Store the candidate result info
+                        candidate_result = {
+                            "idx": idx,
+                            "rank": i,
+                            "score": float(distances[0][i]),
+                            "metadata": metadata,
+                            "text": text
+                        }
+                        candidate_results.append(candidate_result)
                         
-                        results.append({
-                            "score": float(distances[0][i]),  # For L2 index, distance is squared L2. Lower is better.
-                            "metadata": enhanced_metadata
-                        })
+                        # Create filtering task if filtering is requested
+                        if request.filter_noise:
+                            task = filter_content_async(text)
+                            filtering_tasks.append((candidate_result, task))
+            
+            # If filtering is enabled, process filtering results
+            if request.filter_noise and filtering_tasks:
+                # Execute all filtering tasks in parallel
+                for candidate, task in filtering_tasks:
+                    filter_result = await task
+                    
+                    # Add to results if it shouldn't be filtered
+                    if not filter_result.get("should_filter", False):
+                        if len(results) < request.top_k:
+                            enhanced_metadata = format_paper_info(candidate["metadata"])
+                            results.append({
+                                "score": candidate["score"],
+                                "metadata": enhanced_metadata
+                            })
+                    else:
+                        filtered_count += 1
+                        logger.debug(f"Filtered content: {filter_result.get('reason', 'Unknown reason')}")
+            else:
+                # If no filtering, just add results up to top_k
+                for candidate in candidate_results[:request.top_k]:
+                    enhanced_metadata = format_paper_info(candidate["metadata"])
+                    results.append({
+                        "score": candidate["score"],
+                        "metadata": enhanced_metadata
+                    })
 
         logger.info(f"Search completed. Found {len(results)} results for query: '{query_to_use}' (filtered {filtered_count} noisy results)")
         response = {
@@ -858,7 +1113,7 @@ def search_documents(request: SearchRequest):
 # --- Steered Search Endpoint ---
 
 @app.post("/steered_search")
-def steered_search_documents(request: SteeredSearchRequest):
+async def steered_search_documents(request: SteeredSearchRequest):
     global FAISS_INDEX, STORED_METADATA, SAE_MODEL
 
     if SAE_MODEL is None or FAISS_INDEX is None:
@@ -877,7 +1132,7 @@ def steered_search_documents(request: SteeredSearchRequest):
         query_to_use = original_query
         
         # Apply query rewriting if requested and Claude client is available
-        if request.rewrite_query and CLAUDE_CLIENT and CLAUDE_CLIENT.api_key:
+        if request.rewrite_query and CLAUDE_CLIENT and CLAUDE_CLIENT.client is not None:
             try:
                 logger.info(f"Attempting to rewrite query: '{original_query}'")
                 rewritten_query = CLAUDE_CLIENT.rewrite_query(original_query)
@@ -967,31 +1222,62 @@ def steered_search_documents(request: SteeredSearchRequest):
         logger.info(f"Searching index with {FAISS_INDEX.ntotal} vectors for top {extra_k} results (will filter down to {request.top_k}).")
         distances, indices = FAISS_INDEX.search(query_emb_np, extra_k)
 
-        # Process results with filtering
+        # Process results with parallel filtering
         results = []
         filtered_count = 0
+        filtering_tasks = []
+        candidate_results = []
+        
         if indices.size > 0:
+            # First collect all candidate results and create filtering tasks
             for i, idx in enumerate(indices[0]):
-                if idx != -1 and len(results) < request.top_k:
-                    # Ensure metadata exists for the index
+                if idx != -1:  # FAISS returns -1 for padding if fewer results than k are found
                     if 0 <= idx < len(STORED_METADATA):
                         metadata = STORED_METADATA[idx]
                         text = metadata.get("text", "")
                         
-                        # Apply filtering if requested
-                        if request.filter_noise and is_citation_or_noise(text):
-                            filtered_count += 1
-                            continue  # Skip this result
-                            
-                        # Format paper information
-                        enhanced_metadata = format_paper_info(metadata)
-                        
-                        results.append({
+                        # Store the candidate result info
+                        candidate_result = {
+                            "idx": idx,
+                            "rank": i,
                             "score": float(distances[0][i]),
-                            "metadata": enhanced_metadata
-                        })
+                            "metadata": metadata,
+                            "text": text
+                        }
+                        candidate_results.append(candidate_result)
+                        
+                        # Create filtering task if filtering is requested
+                        if request.filter_noise:
+                            task = filter_content_async(text)
+                            filtering_tasks.append((candidate_result, task))
+            
+            # If filtering is enabled, process filtering results
+            if request.filter_noise and filtering_tasks:
+                # Execute all filtering tasks in parallel
+                for candidate, task in filtering_tasks:
+                    filter_result = await task
+                    
+                    # Add to results if it shouldn't be filtered
+                    if not filter_result.get("should_filter", False):
+                        if len(results) < request.top_k:
+                            enhanced_metadata = format_paper_info(candidate["metadata"])
+                            results.append({
+                                "score": candidate["score"],
+                                "metadata": enhanced_metadata
+                            })
                     else:
-                         logger.warning(f"FAISS index {idx} is out of bounds for STORED_METADATA (size {len(STORED_METADATA)}). Skipping result.")
+                        filtered_count += 1
+                        logger.debug(f"Filtered content: {filter_result.get('reason', 'Unknown reason')}")
+            else:
+                # If no filtering, just add results up to top_k
+                for candidate in candidate_results[:request.top_k]:
+                    enhanced_metadata = format_paper_info(candidate["metadata"])
+                    results.append({
+                        "score": candidate["score"],
+                        "metadata": enhanced_metadata
+                    })
+        else:
+            logger.warning(f"FAISS index {idx} is out of bounds for STORED_METADATA (size {len(STORED_METADATA)}). Skipping result.")
 
         search_type = f"Steered ({len(applied_steering_info)} features)" if applied_steering_info else "Non-Steered"
         logger.info(f"{search_type} search completed. Found {len(results)} results (filtered {filtered_count} noisy results).")
@@ -1122,7 +1408,7 @@ async def auto_steered_search(request: AutoSteeredSearchRequest):
         )
         
         # Step 6: Execute steered search with selected parameters
-        search_results = steered_search_documents(steered_request)
+        search_results = await steered_search_documents(steered_request)
         
         # Add auto-steering info to the response
         search_results["auto_steering"] = {

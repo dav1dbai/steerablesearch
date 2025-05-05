@@ -97,6 +97,25 @@ Select up to 5 features that would most effectively steer the search.
 Provide ONLY the JSON with no other text.
 """
 
+CONTENT_FILTERING_PROMPT_TEMPLATE = """
+I need you to evaluate if the following text chunk from an arXiv paper is primarily citation text, references, or low-quality content that should be filtered out from search results.
+
+TEXT CHUNK:
+---
+{text_chunk}
+---
+
+Evaluate if this chunk should be filtered out based on these criteria:
+1. High density of citation patterns like [1], (2020), et al.
+2. Primarily reference or bibliography section content
+3. Mostly numbered references (lines starting with numbers followed by dots or parentheses)
+4. Mostly whitespace or very short content with low information value
+5. Boilerplate text with little scientific value
+
+Return ONLY a JSON with a boolean "should_filter" and a brief "reason":
+{{"should_filter": true/false, "reason": "Brief explanation of why this should or should not be filtered"}}
+"""
+
 class ClaudeAPIClient:
     """Client for interacting with Claude API"""
     
@@ -142,7 +161,7 @@ class ClaudeAPIClient:
 
             # With the new anthropic client logic:
             message = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022", # Use the latest Sonnet model
+                model="claude-3-7-sonnet-20250219", # Use the latest Sonnet model
                 max_tokens=1024, # Keep max_tokens, or adjust as needed
                 messages=[
                     {"role": "user", "content": prompt}
@@ -311,3 +330,65 @@ class ClaudeAPIClient:
         except Exception as e:
             logger.error(f"Error rewriting query '{query}': {e}")
             return query  # Return original query if an error occurs
+    
+    def filter_content(self, text_chunk: str) -> Dict[str, Any]:
+        """
+        Use Claude to determine if content should be filtered out.
+        
+        Args:
+            text_chunk: The text content to evaluate
+            
+        Returns:
+            Dictionary with 'should_filter' boolean and 'reason' string
+        """
+        if not self.client:
+            logger.error("Cannot filter content, client not initialized.")
+            return {"should_filter": False, "reason": "Unable to connect to Claude API"}
+        
+        # Create a simple cache key based on the hash of the text
+        cache_key = f"filter_{hash(text_chunk[:100])}"
+        if cache_key in self.query_cache:
+            logger.info("Using cached content filtering decision")
+            return self.query_cache[cache_key]
+        
+        # Truncate very long text chunks to keep prompt within limits
+        MAX_CHUNK_LENGTH = 4000
+        text_to_analyze = text_chunk
+        if len(text_chunk) > MAX_CHUNK_LENGTH:
+            text_to_analyze = text_chunk[:MAX_CHUNK_LENGTH] + "... [truncated]"
+        
+        try:
+            logger.info("Filtering content with Claude")
+            
+            # Format the prompt
+            prompt = CONTENT_FILTERING_PROMPT_TEMPLATE.format(
+                text_chunk=text_to_analyze
+            )
+            
+            # Call Claude API
+            response = self.call_claude_api(prompt)
+            
+            if not response or not response.strip():
+                logger.error("Failed to get content filtering response from Claude API")
+                return {"should_filter": False, "reason": "No response from filtering API"}
+            
+            # Parse the JSON response
+            try:
+                filter_decision = json.loads(response.strip())
+                
+                if not isinstance(filter_decision, dict) or 'should_filter' not in filter_decision:
+                    logger.error(f"Invalid content filtering response format: {response}")
+                    return {"should_filter": False, "reason": "Invalid filtering response format"}
+                
+                # Cache the result
+                self.query_cache[cache_key] = filter_decision
+                
+                return filter_decision
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in content filtering response: {e}, response: {response}")
+                return {"should_filter": False, "reason": "Invalid JSON response from filtering API"}
+            
+        except Exception as e:
+            logger.error(f"Error in content filtering: {e}")
+            return {"should_filter": False, "reason": f"Error during filtering: {str(e)}"}
