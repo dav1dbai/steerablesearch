@@ -1111,6 +1111,10 @@ async def search_documents(request: SearchRequest):
         raise HTTPException(status_code=500, detail=f"Failed to perform search: {str(e)}")
 
 # --- Steered Search Endpoint ---
+# Implements steerable search by:
+# 1. Embedding the query using the SAME baseline model/layer as document indexing
+# 2. Applying steering vectors as post-processing offset to maintain embedding space consistency
+# 3. Using the modified embedding to search the FAISS index
 
 @app.post("/steered_search")
 async def steered_search_documents(request: SteeredSearchRequest):
@@ -1143,13 +1147,42 @@ async def steered_search_documents(request: SteeredSearchRequest):
                 logger.error(f"Error during query rewriting: {e}. Using original query.")
                 query_to_use = original_query
 
+        # Use SAME embedding approach as the document indexing process to maintain embedding space alignment
+        logger.info(f"Embedding search query: '{query_to_use}' using baseline model (same as document indexing)")
+
+        # --- BASELINE EMBEDDING (same as document indexing) ---
+        # Embed query using baseline model - IDENTICAL to normal search and document indexing
+        query_hidden_states = BASELINE_EMBED_FUNCTION(
+            BASELINE_MODEL, BASELINE_TOKENIZER, query_to_use, TARGET_EMBEDDING_LAYER
+        )
+
+        # Convert query embedding to numpy float32 and average sequence dimension - IDENTICAL to document indexing
+        if _MLX_AVAILABLE and BASELINE_EMBED_FUNCTION.__name__ == 'embed_mlx':
+            query_emb_np_full = np.array(query_hidden_states, dtype=np.float32)
+        elif _TORCH_AVAILABLE and BASELINE_EMBED_FUNCTION.__name__ == 'embed_torch':
+            query_emb_np_full = query_hidden_states.cpu().numpy().astype(np.float32)
+        else:
+            raise RuntimeError("Unknown embedding function type during search.")
+
+        # Average sequence dimension -> (embedding_dim,) - IDENTICAL to document indexing
+        if query_emb_np_full.shape[1] > 0:
+             query_vector_avg = np.mean(query_emb_np_full[0, :, :], axis=0)
+        else:
+             logger.warning(f"Query '{request.query}' resulted in empty sequence embedding. Using zeros.")
+             query_vector_avg = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+
+        # Ensure the final vector has the correct shape
+        if query_vector_avg.shape != (EMBEDDING_DIM,):
+             raise ValueError(f"Unexpected averaged query embedding shape: {query_vector_avg.shape}. Expected: ({EMBEDDING_DIM},)")
+
+        # --- STEERING PROCESS (as post-processing) ---
+        total_steering_offset = np.zeros_like(query_vector_avg)  # Initialize offset tensor 
+        applied_steering_info = []  # Store details of features successfully applied
+
         # Process steering parameters if available
         if request.steering_params:
             logger.info(f"Processing {len(request.steering_params)} steering parameters...")
             valid_feature_ids = set(SAE_MODEL.explanations_df['feature'].unique()) if SAE_MODEL.explanations_df is not None else set()
-            
-            # Prepare steering parameters in the format needed for get_multi_steered_activation
-            steering_params_for_hook = []
             
             for param in request.steering_params:
                 feature_id = param.feature_id
@@ -1160,17 +1193,18 @@ async def steered_search_documents(request: SteeredSearchRequest):
                     continue
 
                 try:
-                    # Get max activation for scaling for tracking/logging
+                    # Get max activation for scaling
                     max_act = SAE_MODEL.get_feature_max_activation(feature_id)
                     if max_act is None or max_act == 0: 
                         logger.warning(f"Max activation for feature {feature_id} is invalid ({max_act}). Using default value.")
-                        max_act = 1.0  # Use a default for logging, actual max_act will be handled in the hook
+                        max_act = 1.0  # Use default value
 
-                    # Add to parameters for the hook - ensure we use dict format for hook
-                    steering_params_for_hook.append({
-                        'feature_id': feature_id,
-                        'strength': strength
-                    })
+                    # Get the steering vector (decoder weight)
+                    steering_vector = SAE_MODEL.sae.W_dec[feature_id].cpu().numpy().astype(np.float32)
+                    
+                    # Calculate offset for this feature - ensuring same data type as embeddings
+                    offset = strength * max_act * steering_vector
+                    total_steering_offset += offset
 
                     # Log applied feature details
                     explanation_rows = SAE_MODEL.explanations_df[SAE_MODEL.explanations_df['feature'] == feature_id]
@@ -1181,41 +1215,27 @@ async def steered_search_documents(request: SteeredSearchRequest):
                         "max_activation_used": max_act,
                         "explanation": explanation
                     })
-                    logger.info(f"Adding steering for feature {feature_id} with strength {strength:.2f}")
+                    logger.info(f"Applied steering offset for feature {feature_id} with strength {strength:.2f}")
 
                 except Exception as e:
                     logger.error(f"Error processing steering parameter for feature {feature_id}: {e}", exc_info=True)
             
-            # Apply steering vectors DURING the model forward pass by using hooks
-            # This is significantly different from the previous approach which calculated
-            # embeddings first and then added steering vectors as a post-processing step
-            if steering_params_for_hook:
-                logger.info(f"Getting multi-steered activation with {len(steering_params_for_hook)} features")
-                # This call runs the query through a model with hooks that apply steering at the right layer
-                query_embedding_tensor = SAE_MODEL.get_multi_steered_activation(query_to_use, steering_params_for_hook)
-                logger.info(f"Successfully retrieved steered embedding with shape {query_embedding_tensor.shape}")
+            # Apply steering by adding vectors to baseline embedding as post-processing
+            if len(applied_steering_info) > 0:
+                logger.info(f"Applying combined steering from {len(applied_steering_info)} features as post-processing")
+                steered_query_vector = query_vector_avg + total_steering_offset
+                logger.info(f"Successfully applied steering post-processing")
             else:
-                # If no valid steering parameters, just get the regular activation
-                logger.info("No valid steering parameters found. Getting regular activation.")
-                query_embedding_tensor = SAE_MODEL.get_activation(query_to_use)
+                logger.info("No valid steering parameters applied. Using unmodified embedding.")
+                steered_query_vector = query_vector_avg
         else:
-            # No steering requested, get regular activation
-            logger.info("No steering parameters provided. Getting regular activation.")
-            query_embedding_tensor = SAE_MODEL.get_activation(query_to_use)
+            # No steering requested, use the original embedding
+            logger.info("No steering parameters provided. Using unmodified embedding.")
+            steered_query_vector = query_vector_avg
         
-        # Ensure it's on the correct device
-        query_embedding_tensor = query_embedding_tensor.to(SAE_MODEL.device)
-        logger.info(f"Final query embedding shape: {query_embedding_tensor.shape}")
-
-        # Convert tensor to numpy for FAISS
-        # Ensure shape is (1, EMBEDDING_DIM)
-        query_emb_np = query_embedding_tensor.detach().numpy().astype('float32')
-        if query_emb_np.shape != (1, EMBEDDING_DIM):
-             # Add potential reshaping logic if needed (e.g., if pooling was missed in get_activation)
-             if len(query_emb_np.shape) == 3 and query_emb_np.shape[0] == 1:
-                 query_emb_np = np.mean(query_emb_np[0, :, :], axis=0).reshape(1, -1)
-             if query_emb_np.shape != (1, EMBEDDING_DIM):
-                 raise ValueError(f"Unexpected query embedding shape: {query_emb_np.shape}. Expected: (1, {EMBEDDING_DIM})")
+        # Reshape for FAISS search (needs 2D array: [1, embedding_dim])
+        query_emb_np = steered_query_vector.reshape(1, -1).astype(np.float32)
+        logger.info(f"Final query embedding shape: {query_emb_np.shape}")
 
         # Perform FAISS search with more results than needed to account for filtered results
         extra_k = request.top_k * 2  # Get extra results to filter
@@ -1418,7 +1438,7 @@ async def auto_steered_search(request: AutoSteeredSearchRequest):
             rewrite_query=False  # Already rewritten if needed
         )
         
-        # Step 6: Execute steered search with selected parameters (now uses proper in-model steering)
+        # Step 6: Execute steered search with selected parameters using baseline embedding + steering offset
         search_results = await steered_search_documents(steered_request)
         
         # Add auto-steering info to the response
